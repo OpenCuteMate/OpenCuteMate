@@ -397,10 +397,24 @@ renderer behind the same `OverlaySurface`:
 
 There are **no** `unsafe impl Send/Sync` in the final code (the pre-existing
 draft had them; they were removed — everything runs on one thread).
-[Verified by `cargo grep`/audit in Phase 2.]
 
 ## 16. Phase 2 results
 
-(This section is filled in after the PoC validation runs — see
-`compositor-compatibility.md` for the runtime matrix and the final report for
-measurements.)
+All architecture-level assumptions of this document were validated by the
+PoC on Niri 26.04 (2026-11-18), 18/18 automated checks plus live-session
+interaction. Highlights (details and evidence: `docs/compositor-compatibility.md` §7):
+
+- The teardown order (§6) is **observable in the logs** of every clean exit:
+  renderer → platform/session, and was exercised by the automated
+  right-click-quit test and by a human on the live session.
+- The scheduler (§8) parks with **0 CPU ticks over 3–5 s and 0 frames
+  presented**; interaction renders one frame per event and parks again
+  (~14 frames total for a scripted startup+hover+drag+quit session).
+- The platform/renderer split held: `ocm-renderer` never imports a Wayland
+  crate; `ldd ocm-runtime` shows no X11/XCB linkage.
+- One real bug was caught by the automated suite and fixed: the frame
+  callback must be requested **before** the commit it latches onto (§8) —
+  requesting it after `present()` left it pending forever, so parking
+  required external input.
+- Fractional scaling (1.25×) is exercised natively by the dev machine and
+  verified pixel-exactly through the viewporter path (§12).

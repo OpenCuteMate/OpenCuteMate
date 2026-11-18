@@ -138,5 +138,19 @@ us, not be embedded by us — details in §3.
 
 ## 6. Phase 2 results relevant to this decision
 
-(Filled after validation: confirm that the wgpu-direct PoC validated the
-surface/alpha/input/scheduler unknowns that this decision rests on.)
+The wgpu-direct PoC validated every unknown this decision rests on
+(Niri 26.04, 18/18 automated checks + live interaction, 2026-11-18):
+
+- Native Wayland layer-shell overlay with per-pixel alpha over the desktop:
+  pixel-verified (transparent, opaque **and** partially-transparent content).
+- wgpu 30 surface creation from raw Wayland handles on Vulkan/NVIDIA works;
+  the `NativeHandles` seam stayed renderer-side clean (no Wayland types).
+- Input-region click-through, dragging with region updates, and
+  frame-callback-driven scheduling all work; idle = 0 CPU ticks, 0 GPU work.
+- Hyprland remains untested at runtime (nesting blocker documented in
+  `docs/compositor-compatibility.md` §4) — the Phase 2b Bevy decision does
+  not depend on it, but portability claims do until tested.
+
+Conclusion for Phase 2b: the PoC's platform/renderer contracts
+(`ocm-platform`, `SceneState`) are stable enough to build the Bevy
+integration against, exactly as §4 and §5 predicted.

@@ -447,6 +447,30 @@ trigger; noted as a robustness TODO, not a correctness issue for the PoC.
 
 ## 9. Phase 2 results
 
-(Filled in after validation runs — see `compositor-compatibility.md` and the
-final report: actual capabilities, alpha modes, formats, and measured
-behavior.)
+Measured on Niri 26.04 + NVIDIA RTX 5050 (proprietary 620.70.06, Vulkan
+1.4.363) — [Verified — runtime, 2026-11-18]:
+
+- `SurfaceCapabilities::formats` =
+  `[Bgra8UnormSrgb, Rgba8UnormSrgb, Rgba16Float, Rgb10a2Unorm, Bgra8Unorm, Rgba8Unorm]`;
+  the picker chose **Bgra8Unorm** (8-bit UNORM family preferred, §2.3).
+- `alpha_modes` = `[Opaque, PreMultiplied]` → **PreMultiplied** selected
+  (priority order of §2.4); the shader runs in premultiplied output mode,
+  confirmed by the partial-alpha pixel analysis (darkened-magenta shadow
+  band composites exactly as (1−a)·background).
+- `present_modes` = `[Mailbox, Fifo]` → Fifo (vsync default).
+- Fractional scale path exercised natively: `preferred_scale = 150`
+  (= 1.25×), logical 1536×864 → buffer 1920×1080 via `wp_viewporter`;
+  pixel-verified exact.
+- Idle: 0 CPU ticks / 3–5 s, 0 frames presented; `nvidia-smi pmon` shows
+  the process GPU context alive with all utilization columns empty.
+- One correctness lesson learned the hard way (caught by the automated
+  suite): `wl_surface.frame` must be requested **before** the commit it
+  latches onto. Requested after `present()`, it stays pending forever (no
+  following commit exists), and the render loop cannot park without
+  external input. The implemented sequence is now
+  request → render → present.
+- wgpu 30 API deltas confirmed at runtime: `Queue::present(SurfaceTexture)`
+  (present moved off `SurfaceTexture`), and `CurrentSurfaceTexture`'s
+  Timeout/Occluded skip paths.
+- The EAGAIN-tolerant read in the calloop source behaved as designed
+  (spurious wakeups logged at debug, never fatal across all runs).

@@ -77,31 +77,59 @@ that fails is recorded verbatim in §4 (failures are data, not noise).
 
 ## 4. Hyprland plan and results
 
-Hyprland is **not installed** on the dev machine. Options evaluated:
+Hyprland is **not part of the default install** on the dev machine. For the
+Phase 2 validation, two acquisition routes were evaluated and attempted:
 
-1. **Nix binary cache** (`nix run nixpkgs#hyprland`): feasible — Nix 2.35.2
-   present, Hyprland is in nixpkgs with binary substitutes. Status of the
-   attempt: **[Unresolved until executed — see final report §8]**.
-2. Distro packaging: not available for this distro at the moment.
-3. Manual build from source: rejected for the PoC window (long C++ build).
+1. **Nix binary cache** (`nix build nixpkgs#hyprland`): fetched Hyprland
+   0.57.2 without compiling — but the nix build's Mesa has the NixOS path
+   `/run/opengl-driver` hard-baked as its driver search path, which does not
+   exist on Arch; nested startup aborted in `CBackend::create()`
+   (`MESA-LOADER: failed to open dri: /run/opengl-driver/lib/gbm/...`).
+   Working around it requires the standard NixOS-on-foreign-distro symlink
+   (`/run/opengl-driver → /usr`, root-owned) or installing the distro
+   package instead.
+2. **Arch system package** (`extra/hyprland 0.57.2`, installed with user
+   consent): nested launch under the live Niri 26.04 host **deadlocks before
+   the first successful frame**. Aquamarine 0.16 creates its Wayland output,
+   receives `xdg_toplevel.configure` (720x734) and allocates GBM buffers —
+   then loops forever on
+   `WARN from aquamarine: Output WAYLAND-1: pending state has a
+   non-released buffer`, re-acking the same configure ~every 2 s. The window
+   never maps on the host (`niri msg windows` never lists it; host
+   screenshots show nothing), and the compositor never creates its client
+   Wayland socket, so `ocm-runtime` cannot connect.
 
-The test script `tests/hyprland.sh` is written and parameterized so that the
-suite can run against any Hyprland binary (system or Nix). It:
+   The deadlock is independent of every variable tried:
+   GBM backend/GPU (AMD radeonsi via `/dev/dri/card2`, NVIDIA via
+   `GBM_BACKEND=nvidia-drm` + `AQ_DRM_DEVICES=/dev/dri/card1`),
+   buffer modifiers (`AQ_NO_MODIFIERS=1`), XDG_RUNTIME_DIR (shared — stalls
+   on the host's `wayland-1` socket lock; private — correct fix, see below),
+   and XWayland (`xwayland { enabled = false }`). Aquamarine's X11 backend
+   is not available in 0.16.
 
-- launches Hyprland **nested** in the current Wayland session (Wayland
-  backend), captures `HYPRLAND_INSTANCE_SIGNATURE`,
-- discovers the nested compositor's Wayland socket,
-- runs `ocm-runtime` against it with a deterministic background
-  (Hyprland config `misc:background_color` / wallpaper), performs the same
-  pixel-sampling checks as the Niri suite,
-- drives input with `ydotool` (pointer move / drag / right-click),
-- uses `hyprctl -i <sig> layers` for protocol-level layer evidence and
-  `grim` for screenshots (Hyprland implements wlr-screencopy /
-  ext-image-copy-capture — [Verified — source: Hyprland wiki/ecosystem;
-  runtime pending]).
+   Two hard requirement discovered for nesting Hyprland under another
+   compositor (both now encoded in `tests/hyprland.sh`):
+   - a **private `XDG_RUNTIME_DIR`** for the nested instance (it would
+     otherwise fight the host over the `wayland-1` socket/lock name), with
+     the parent connection given as an **absolute socket path**
+     (`WAYLAND_DISPLAY=/run/user/1000/wayland-1`);
+   - short paths (unix socket 108-byte limit —
+     `[IPC::Socket2] path is too long` on deep work dirs).
 
-**Hyprland rows above stay Assumption/Unresolved until this section records
-an actual run.**
+**Status: Hyprland runtime validation NOT completed — blocked by the
+aquamarine-0.16-nested-under-niri-26.04 pre-map deadlock above, not by
+anything in OpenCuteMate.** `tests/hyprland.sh` is complete and
+parameterized (`HYPRland_BIN`, or system/nix auto-detection) and passes the
+same 18-check suite the moment it runs against a compositor that finishes
+starting — e.g. on any machine with a real Hyprland session, or once the
+nesting deadlock is fixed upstream. Per the project rules, all Hyprland
+matrix rows below remain **[Assumption]/[Unresolved]** and no Hyprland
+support is claimed.
+
+What can be stated at source level (still not runtime-verified here):
+Hyprland's wiki documents layer surfaces (`hyprctl layers`, layer rules with
+`namespace` matching and `ignore_alpha`/blur effects implying per-pixel alpha
+compositing of layer surfaces) — [Verified — source].
 
 ## 5. GNOME (out of scope, one paragraph)
 
@@ -119,15 +147,54 @@ shows no libX11/libxcb linked; ldd check in test suite.]
 
 ## 7. Phase 2 runtime results
 
-### Niri 26.04 (native session) — filled after `tests/niri.sh`
+### Niri 26.04 (nested automated suite, 2026-11-18) — 18/18 PASS
 
-- Run date: 2026-11-18 (see final report for the full log).
-- Every [Verified — runtime] row in §2 traces to a check in that suite.
-- Notable measured values (formats/alpha modes/present modes/refresh,
-  idle CPU): recorded in the final report and `docs/wayland-feasibility.md` §9.
+Run: `tests/niri.sh` (non-intrusive: input injected via
+`zwlr_virtual_pointer` into the nested compositor; the host session and
+physical pointer are never touched). Evidence per check:
 
-### Hyprland — filled after `tests/hyprland.sh`
+| Check | Evidence |
+|---|---|
+| Layer-shell registered | `niri msg layers` lists namespace `opencutemate`, keyboard interactivity `none` |
+| Configure cycle | configure received + `ack_configure` before the following commit (app log) |
+| wgpu surface | `format=Bgra8Unorm alpha_mode=PreMultiplied present_mode=Fifo` (NVIDIA RTX 5050, Vulkan 1.4.363, proprietary 620.70.06) |
+| Alpha modes offered | `[Opaque, PreMultiplied]` — queried, not hardcoded; PreMultiplied chosen |
+| No XWayland | `ldd ocm-runtime` shows no libX11/libxcb |
+| Idle CPU | **0 ticks / 3 s** (procfs utime+stime delta), **0 frames presented** during the window; thread parked in `dispatch(None)` |
+| Idle GPU (live session) | `nvidia-smi pmon`: `ocm-runtime` context alive with **all utilization columns empty** while niri itself shows ~12% SM; 0 CPU ticks over 5 s |
+| Transparent pixels | screenshot corners exactly (255,0,255) — the magenta desktop shows through the overlay |
+| Opaque pixels | cube box at requested position 100% non-background |
+| Partially transparent pixels | **6132** darkened-magenta pixels in the shadow band (premultiplied blend over the background) |
+| Drag | virtual-pointer drag to (0.22,0.3); post-drag screenshot pixel-verifies the cube at the new position; input region followed the character |
+| Click-through | left click far from the character produced **no** `pointer button` events in the app log |
+| Right-click quit | exit 0; `right click on character; quitting` logged |
+| Teardown order | `teardown: dropping renderer (wgpu surface) first` → `dropping platform/wayland session` → `teardown complete` |
 
-- (Pending; will contain: version, protocol availability from the app's
-  global log, pixel-test results, input-test results, idle measurements, and
-  any failures with exact errors.)
+Fractional scaling was exercised **for real**: the host output is
+1920×1080 @ 1.25× (logical 1536×864); `wp_fractional_scale_v1.preferred_scale
+= 150` (units of 1/120) → buffer 1920×1080 via `wp_viewporter` mapping onto
+1536×864 logical — pixel-exact screenshot analysis at logical coordinates
+confirms correctness.
+
+A real scheduler bug was caught by the suite: the `wl_surface.frame`
+request must be issued **before** the commit it should latch onto; issuing
+it after `present()` left the callback pending forever (no commit follows),
+so the app could only park after external input. Fixed in
+`ocm-runtime::render_now` (request → render → present) and documented in
+`docs/architecture.md` §8.
+
+Additional live-session (non-nested) evidence: the same binary ran
+directly on the user's session, where a human dragged the character across
+the screen and quit via right-click — with the same clean teardown logs.
+Multi-monitor discovery also verified live: eDP-1 (1.25×) and HDMI-A-1
+(1×) are reported as distinct outputs after the per-name `wl_registry.bind`
+fix.
+
+### Hyprland — attempted, blocked (see §4)
+
+`tests/hyprland.sh` prepared and executed against Hyprland 0.57.2 (nix and
+Arch packages); nested startup deadlocks in aquamarine before the first
+frame, independent of GPU/backend/modifier/runtime-dir/XWayland choices
+(exact logs in §4). No Hyprland claims are made; the suite remains ready to
+run in any environment where nested Hyprland completes startup or on a real
+Hyprland session.

@@ -1,2 +1,3 @@
 [toolchain]
-channel = "stable"
+# Pinned for reproducibility; matches rust-version in Cargo.toml.
+channel = "1.98.0"
