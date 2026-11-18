@@ -358,21 +358,24 @@ matching protocol semantics.]
   (logical 1536×864) [Verified via `niri msg outputs`], so the fractional path
   is exercised on real hardware, not just in theory.
 
-## 13. Future: Bevy integration (Phase 2b+)
+## 13. Bevy integration (Phase 2b — implemented)
 
-The renderer trait boundary is designed so Bevy can replace the wgpu-direct
-renderer behind the same `OverlaySurface`:
+The renderer trait boundary now has two backends behind one contract
+(`ocm-renderer::Renderer`), selected at runtime via
+`ocm-runtime --renderer wgpu|bevy` (default: wgpu, the regression
+reference):
 
-- Bevy's `WinitSettings`/render path would be bypassed; Bevy 0.15+ can render
-  to a raw surface via its window backend or a custom render app. The
-  `NativeHandles` bridge stays identical.
-- `SceneState` (pure data) maps onto a Bevy component/ECS world.
-- The scheduler's three states map onto Bevy's run conditions
-  (`condition::run_once`-style state gating) with the same frame-callback
-  driver; Bevy's `ron`/asset system supersedes `ocm-core` config gradually.
-- Open questions (deferred, honest scope): Bevy surface creation from raw
-  Wayland handles without winit, and Bevy's present/vsync integration with
-  externally-driven frame callbacks. [Unresolved — deliberate Phase 2b work.]
+- `ocm-renderer/src/wgpu/` — the Phase 2 renderer, unchanged.
+- `ocm-renderer/src/bevy/` — Bevy 0.20.1 driven against the same
+  `OverlaySurface`: a `Window` + `RawHandleWrapper` entity built from
+  `NativeHandles` (no `bevy_winit`, no second window), scene entities
+  placed by the *shared* `scene.rs` math, and one `app.update()` per
+  scheduler-decided frame. The scheduler remains authoritative: zero
+  updates while parked.
+- Design, sources, pitfalls and the measured performance comparison:
+  `docs/bevy-integration.md` (§9 has the Phase 2b results).
+
+Both backends pass the full Niri regression suite (19/19 each).
 
 ## 14. Future: Windows and macOS
 
@@ -392,11 +395,13 @@ renderer behind the same `OverlaySurface`:
 
 | Location | Unsafe | Why required | Safety argument |
 |---|---|---|---|
-| `ocm-renderer`: `create_surface_unsafe(SurfaceTargetUnsafe::RawHandle { .. })` | 1 call | wgpu offers no safe path for externally-owned raw Wayland handles | Handles are guaranteed valid for the Surface's whole lifetime by the documented teardown order (§6); pointers obtained from live proxies owned by `Shared` |
+| `ocm-renderer/wgpu`: `create_surface_unsafe(SurfaceTargetUnsafe::RawHandle { .. })` | 1 call | wgpu offers no safe path for externally-owned raw Wayland handles | Handles are guaranteed valid for the Surface's whole lifetime by the documented teardown order (§6); pointers obtained from live proxies owned by `Shared` |
+| `ocm-renderer/bevy/handles.rs`: `HasWindowHandle`/`HasDisplayHandle` impls (`WindowHandle::borrow_raw` / `DisplayHandle::borrow_raw`) | 2 calls | Bevy's `RawHandleWrapper::new` consumes the standard rwh traits over our handles | Same contract as above: the handles come from live Wayland objects owned by `Shared`; valid until the renderer drops (teardown order §6) |
+| `ocm-renderer/bevy/handles.rs`: `unsafe impl Send/Sync for NativeSurface` | 2 impls | Bevy's `WindowWrapper<W>` requires `W: Send + Sync + 'static` | The pointers are only copied into wgpu surface creation and dereferenced by the Vulkan WSI while the owning objects are alive; rendering is non-pipelined (all use on the main thread). Same in kind as Bevy's own `RawHandleWrapper` and winit's `SendSyncRawWindowHandle` unsafe impls |
 | `ocm-platform-wayland`: reading `wl_display`/`wl_surface` raw pointers from `wayland-client` (`display_ptr()`, `ObjectId::as_ptr()`) | raw pointer → `NonNull` | wgpu needs the raw pointers; `wayland-client` (sys backend) provides them [Verified API] | Pointers are only converted to `NonNull` and copied into the rwh enums; they are dereferenced only by wgpu/Vulkan while the owning proxies are alive (teardown order §6) |
 
-There are **no** `unsafe impl Send/Sync` in the final code (the pre-existing
-draft had them; they were removed — everything runs on one thread).
+There are **no** `unsafe impl Send/Sync` on platform types (the one pair
+above is on the renderer-side handle wrapper, documented in place).
 
 ## 16. Phase 2 results
 
@@ -418,3 +423,31 @@ interaction. Highlights (details and evidence: `docs/compositor-compatibility.md
   required external input.
 - Fractional scaling (1.25×) is exercised natively by the dev machine and
   verified pixel-exactly through the viewporter path (§12).
+
+## 17. Phase 2b results
+
+The Bevy backend (§13) was implemented against the same contracts and
+validated by the same automated suite on the same day:
+
+- **Regression:** nested Niri, 19/19 PASS for `--renderer wgpu` *and*
+  `--renderer bevy` (the suite gained the `OCM_RENDERER` variable; both
+  runs exit 0). Partial-alpha shadow band: 6132 pixels in both backends
+  — the shared placement math keeps hitboxes and screen placement
+  identical.
+- **Scheduler authority preserved:** Bevy contributes zero CPU ticks
+  while parked (procfs over 10 s, both backends); the runtime calls
+  `app.update()` only when a frame is due.
+- **Pitfalls found and fixed during integration** (each reproduced, then
+  verified fixed): no-winit plugin ordering; the phantom
+  `WindowPlugin::primary_window`; the `tonemapping_luts` dependency of
+  the default tonemapper that silently stopped all presents; the
+  first-present warm-up needed because the first frames present before
+  the fullscreen-blit pipeline compiles; manual render creation for
+  surface-compatible adapter selection. Full narrative:
+  `docs/bevy-integration.md` §9.
+- **Measured comparison** (`tests/perf.sh`, nested Niri; see
+  `docs/bevy-integration.md` §9 for the full table): both backends idle
+  at 0 CPU/0 GPU; Bevy costs ~4–6× more CPU per animated frame
+  (113 vs 27 ms/s release @60 fps), ~250 MB more memory and ~0.9 s more
+  startup, and paces at 18.4 ms mean (release) vs the wgpu renderer's
+  17.0 ms.

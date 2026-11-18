@@ -1,26 +1,31 @@
 # ocm-runtime
 
 The OpenCuteMate PoC runtime: a native Wayland layer-shell overlay with a
-wgpu-rendered transparent character (currently a procedural cube), pointer
-interaction, click-through, and an event-driven render scheduler.
+selectable rendering backend (wgpu-direct or Bevy), a transparent
+procedural character (currently a cube), pointer interaction,
+click-through, and an event-driven render scheduler.
 
 ## Build
 
 ```sh
-cargo build -p ocm-runtime            # debug
-cargo build --release -p ocm-runtime  # release
+cargo build -p ocm-runtime            # debug (both backends)
+cargo build --release -p ocm-runtime
+cargo build -p ocm-runtime --no-default-features --features renderer-wgpu  # bevy-less build
 ```
 
 Requires a Rust toolchain matching `rust-toolchain.toml` and a Vulkan
 driver. No system Wayland libraries are needed to build (wayland-client
-links libwayland dynamically at runtime — the session already provides it).
+links libwayland dynamically at runtime — the session already provides
+it). The default build includes both backends; `--renderer` selects at
+runtime.
 
 ## Run
 
 From a Wayland session (Niri, or any wlr-layer-shell compositor):
 
 ```sh
-cargo run -p ocm-runtime
+cargo run -p ocm-runtime                      # wgpu backend (default)
+cargo run -p ocm-runtime -- --renderer bevy  # Bevy backend
 ```
 
 You should see a floating cube near the center of the screen:
@@ -34,6 +39,7 @@ You should see a floating cube near the center of the screen:
 ### CLI
 
 ```
+--renderer <NAME>       rendering backend: "wgpu" (default) or "bevy"
 --config <FILE>        TOML configuration file
 --layer <overlay|top>  layer-shell layer (default overlay)
 --click-through         restrict input to the character hitbox (default)
@@ -86,11 +92,14 @@ for the unsafe wgpu surface creation).
 ## Automated validation
 
 ```sh
-tests/niri.sh       # nested Niri: 18 automated checks (non-intrusive)
-tests/hyprland.sh   # same suite against nested Hyprland (see docs for status)
+tests/niri.sh                  # nested Niri: 19 automated checks (wgpu backend)
+OCM_RENDERER=bevy tests/niri.sh  # the same suite against the Bevy backend
+tests/perf.sh [--release]      # repeatable renderer performance comparison
+tests/hyprland.sh               # same suite against nested Hyprland (see docs for status)
 ```
 
 Both suites inject input via `zwlr_virtual_pointer` into the *nested*
 compositor — your physical mouse is never touched. See
 `docs/compositor-compatibility.md` for current results and
-requirements.
+requirements, and `docs/bevy-integration.md` §9 for the backend
+comparison.

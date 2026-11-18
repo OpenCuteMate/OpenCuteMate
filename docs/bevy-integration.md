@@ -59,7 +59,7 @@ Comparison and justification in §5; the concrete design in §6.
 | `raw-window-handle` version used by Bevy 0.20 (`0.6.2`) matches OpenCuteMate's | [Verified — source: registry] |
 | Feature `3d` (the default 3D preset) includes `default_platform` → `bevy_winit`, `x11`, `gilrs`, clipboard, `multi_threaded` | [Verified — source: `bevy-0.20.1/Cargo.toml` features `3d`, `default_platform`] |
 | Feature **`3d_bevy_render`** provides the 3D stack (bevy_render, bevy_core_pipeline, bevy_pbr, bevy_camera, bevy_material, meshes) *without* any winit/x11 | [Verified — source: `bevy-0.20.1/Cargo.toml` features `3d_bevy_render`] |
-| OpenCuteMate's planned feature set: `3d_bevy_render` (+ `bevy_asset`, `bevy_log`, `bevy_transform`, `bevy_window`, `bevy_tasks` as pulled by the stack) — **no** `bevy_winit`, **no** `wayland` feature (that only feeds winit), **no** `x11`, **no** `multi_threaded` requirement | [Verified — probe compiled with `bevy = { default-features = false, features = ["bevy_render", "bevy_pbr", "bevy_core_pipeline", "bevy_camera", "bevy_log", "bevy_asset"] }`] |
+| OpenCuteMate's final feature set: render, camera, core_pipeline, pbr, light, material, mesh, image, asset, log, window — each individually selected, **no** `3d_bevy_render` preset (it force-enables the gltf/gizmo/post-process/anti-alias chain), **no** winit, **no** `wayland` feature (that only feeds winit), **no** x11, **no** `tonemapping_luts` (the camera runs `Tonemapping::None` for parity with the wgpu renderer) | [Verified — probe + implementation: the exact set compiles and runs 19/19] |
 
 Consequence: **no dependency compromise is required**. The Bevy renderer
 enters the workspace as an additional feature-gated backend of
@@ -408,3 +408,97 @@ existing §6 lifetime contract (docs/architecture.md).
 
 The wgpu renderer remains the default backend and the regression
 reference throughout.
+
+---
+
+## 9. Phase 2b results (2026-11-18)
+
+The recommended approach (B) was implemented and validated. Status of
+every open item from §7, plus the pitfalls the implementation itself
+uncovered:
+
+| # | Open question | Resolution |
+|---|---|---|
+| 1 | Does the no-winit stack initialize and run? | **[Verified — runtime]** — with the plugin ordering below. |
+| 2 | First-frame behavior (pipeline compile vs. present) | **Real pitfall, fixed by the warm-up.** The first `app.update()` presents before the fullscreen-blit pipeline has compiled; the compositor then keeps showing that unwritten swapchain buffer after the app parks (stale driver memory). `warm_up()` drives updates until the surface exists, one present landed **and `PipelineCache::waiting_pipelines()` is empty**. |
+| 3 | Idle CPU with task pools | **[Verified — runtime]** — 0 ticks over 10 s parked (procfs), both backends; pool threads park. |
+| 4 | Task-pool requirement | `TaskPoolPlugin` + `AssetPlugin` + `FrameCountPlugin` + `TimePlugin` are all required by the render stack; included. |
+| 5 | sRGB surface vs. wgpu's UNORM | **[Verified — runtime]** — pixel checks pass through the sRGB path; the shadow's partial-alpha band count matches the wgpu renderer exactly (6132 vs. 6132 pixels) once the radial-falloff alpha texture reproduces `cube.wgsl`'s `fs_shadow`. |
+| 6 | CompositeAlphaMode without capability fallback | Unchanged (Bevy maps the request verbatim); PreMultiplied is supported by Niri, logged by our backend. Documented limitation stands. |
+| 7 | Resize/scale flow through the `Window` component | **[Verified — runtime]** — `renderer.resize` updates `WindowResolution`; Bevy's `extract_windows`/`create_surfaces` reconfigure the surface. |
+| 8 | `get_current_texture` latency | **[Verified — runtime]** — interaction latency measured: 2.1 ms (wgpu) vs. 13.3 ms (bevy) pointer-enter→presented-frame. |
+
+**Pitfalls discovered during implementation (all [Verified — runtime],
+each reproduced and fixed):**
+
+1. **Plugin ordering mirrors `DefaultPlugins`, not the dependency
+   graph.** `RenderPlugin` must precede `CorePipelinePlugin`/`PbrPlugin`
+   (it registers the `Shader` asset type they load); `ImagePlugin` must
+   precede `CorePipelinePlugin` (its tonemapping build needs
+   `Assets<Image>`); `bevy::camera::CameraPlugin` (main world) is a
+   separate plugin from `bevy_render`'s internal one and registers
+   `ClearColor` + the visibility propagation systems; `LightPlugin`
+   stays even for unlit scenes (`PbrPlugin`'s shadow-map extraction
+   needs its resources).
+2. **`WindowPlugin::default()` spawns a phantom 1280×720 window** that
+   steals `PrimaryWindow` resolution from our camera. Fixed with
+   `primary_window: None`.
+3. **The default TonyMcMapface tonemapper requires the
+   `tonemapping_luts` feature** — absent from the minimal feature set,
+   the tonemap node errors every frame, the final target is never
+   written and the window stops presenting after warm-up. Fixed by
+   `Tonemapping::None` on the camera (also the honest parity choice:
+   the wgpu renderer applies no tone curve).
+4. **`RenderCreation::Manual` is required, not just nice:** with no
+   Bevy-known primary window, the automatic path selects an adapter
+   without surface-compatibility checking. We create the
+   instance/adapter/device exactly like the wgpu backend.
+5. The gizmo chain (`3d_bevy_render` → `bevy_gizmos_render` →
+   `bevy_light/bevy_gizmos`) force-enables a light-gizmo system that
+   needs `GizmoPlugin`'s assets. Avoided by selecting features
+   individually instead of the `3d_bevy_render` preset.
+
+**Regression:** `tests/niri.sh` — **19/19 PASS for both backends**
+(wgpu and bevy, exit 0 each; `OCM_RENDERER=bevy tests/niri.sh`).
+
+**Performance (measured, nested Niri focused on the host,
+`tests/perf.sh`; dev = default debug profile, rel = opt-level 2):**
+
+| Metric | wgpu dev | bevy dev | wgpu rel | bevy rel |
+|---|---|---|---|---|
+| Startup → first frame | 0.19 s | 1.94 s | 0.21 s | 1.09 s |
+| Idle CPU (parked, 10 s) | 0.0 ms/s | 0.0 ms/s | 0.0 ms/s | 0.0 ms/s |
+| Idle GPU rows (pmon) | none | none | none | none |
+| Active CPU @ 60 fps | 69 ms/s | 452 ms/s | 27 ms/s | 113 ms/s |
+| Active GPU (sm, dev) | 9–12% | 4–13% | — | — |
+| RSS parked | 148 MB | 443 MB | 191 MB | 405 MB |
+| Frame pacing mean | 17.6 ms | 29.9 ms | 17.0 ms | 18.4 ms |
+| Pointer→frame latency | 2.1 ms | 13.3 ms | — | — |
+
+Reading: the architectural promise holds for both backends — **zero
+CPU/GPU while parked**, event-driven rendering, frame-callback pacing.
+Bevy's cost is a ~4–6× higher per-frame CPU price and ~250 MB more
+memory — the expected engine-vs-hand-rolled trade for the ECS, asset
+and material machinery. In release builds Bevy paces within 2 ms of the
+requested 60 fps (18.4 ms mean); in debug builds it misses roughly
+every other vsync (29.9 ms). Startup adds ~0.9–1.7 s, dominated by
+pipeline compilation and plugin setup. These numbers are the *engine
+floor* — scene content (a character mesh, materials, lights) will widen
+the wgpu path's cost far more than Bevy's, which is exactly the trade
+the phase was designed to measure.
+
+**Remaining limitations (unchanged unless noted):**
+
+- Hyprland remains untested/blocked (see
+  `docs/compositor-compatibility.md` §4). The Bevy backend inherits the
+  same untested status there.
+- Bevy trusts the requested `CompositeAlphaMode` without capability
+  fallback (§7 item 6).
+- The Bevy backend reports `FrameOutcome::presented: true` after every
+  update; wgpu-style skip conditions (occluded/timeout/outdated) are not
+  surfaced by Bevy's window path. The runtime's parking logic already
+  tolerates this (frame callbacks govern).
+- Debug-profile builds are heavy: the Bevy dependency set needs
+  multi-GB target space with full debuginfo. The workspace dev profile
+  uses line-tables-only for dependencies (see the root `Cargo.toml`).
+
