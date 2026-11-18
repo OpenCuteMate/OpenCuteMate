@@ -113,7 +113,9 @@ impl App {
         // (Requesting it after present would leave it pending forever.)
         self.overlay.request_frame();
         match self.renderer.render(&scene) {
-            Ok(FrameOutcome { presented: true, .. }) => {
+            Ok(FrameOutcome {
+                presented: true, ..
+            }) => {
                 self.frames += 1;
                 self.last_present = Instant::now();
                 self.dirty = false;
@@ -123,13 +125,19 @@ impl App {
                 }
                 tracing::debug!(frame = self.frames, "frame presented");
             }
-            Ok(FrameOutcome { presented: false, skipped: Some(reason) }) => {
+            Ok(FrameOutcome {
+                presented: false,
+                skipped: Some(reason),
+            }) => {
                 // Transient: retry shortly via a timer (a frame callback
                 // may not fire because nothing was committed).
                 tracing::debug!(reason, "frame skipped");
                 self.schedule_timer(Duration::from_millis(4));
             }
-            Ok(FrameOutcome { presented: false, skipped: None }) => {
+            Ok(FrameOutcome {
+                presented: false,
+                skipped: None,
+            }) => {
                 self.schedule_timer(Duration::from_millis(4));
             }
             Err(e) => {
@@ -451,7 +459,9 @@ fn main() -> ExitCode {
     };
 
     // ---- Renderer -------------------------------------------------------------
-    let render_opts = RenderOpts { vsync: config.render.vsync };
+    let render_opts = RenderOpts {
+        vsync: config.render.vsync,
+    };
     let renderer = match WgpuRenderer::new(
         &overlay.native_handles(),
         overlay.logical_size(),
@@ -481,8 +491,7 @@ fn main() -> ExitCode {
     };
     let handle: LoopHandle<'static, App> = loop_.handle();
 
-    let frame_interval =
-        Duration::from_millis(1000 / config.render.fps_limit.clamp(1, 240) as u64);
+    let frame_interval = Duration::from_millis(1000 / config.render.fps_limit.clamp(1, 240) as u64);
 
     let mut app = App {
         overlay: overlay.clone(),
@@ -584,4 +593,24 @@ fn parse_position(text: &str) -> Option<(f32, f32)> {
         return None;
     }
     Some((x, y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_positions() {
+        assert_eq!(parse_position("0.5,0.5"), Some((0.5, 0.5)));
+        assert_eq!(parse_position(" 0.2 , 0.8 "), Some((0.2, 0.8)));
+        assert_eq!(parse_position("0,1"), Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_malformed_input() {
+        assert_eq!(parse_position("1.5,0.5"), None);
+        assert_eq!(parse_position("0.5"), None);
+        assert_eq!(parse_position("a,b"), None);
+        assert_eq!(parse_position(""), None);
+    }
 }

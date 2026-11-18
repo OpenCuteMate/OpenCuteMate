@@ -31,9 +31,7 @@
 use std::io::{BufRead, Write};
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{
-    wl_pointer::ButtonState, wl_registry::WlRegistry, wl_seat::WlSeat,
-};
+use wayland_client::protocol::{wl_pointer::ButtonState, wl_registry::WlRegistry, wl_seat::WlSeat};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,

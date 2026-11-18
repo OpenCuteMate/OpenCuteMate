@@ -82,10 +82,15 @@ pub struct PointerEvent {
 pub enum PlatformEvent {
     Pointer(PointerEvent),
     /// The overlay's logical size changed (e.g. layer-shell configure).
-    Configure { width: u32, height: u32 },
+    Configure {
+        width: u32,
+        height: u32,
+    },
     /// The compositor's preferred scale for the surface changed
     /// (1.0, 1.25, 2.0, ...).
-    ScaleChanged { scale: f64 },
+    ScaleChanged {
+        scale: f64,
+    },
     /// A frame callback fired: the compositor is ready for the next frame.
     Frame,
     /// The compositor closed the surface; the app should exit.
@@ -163,4 +168,20 @@ pub trait Platform: Sized {
 
     /// Create an overlay surface with the given parameters.
     fn create_overlay(&mut self, params: &OverlayParams) -> Result<Self::Overlay, Self::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_linux_button_codes() {
+        assert_eq!(PointerButton::from_linux_code(0x110), PointerButton::Left);
+        assert_eq!(PointerButton::from_linux_code(0x111), PointerButton::Right);
+        assert_eq!(PointerButton::from_linux_code(0x112), PointerButton::Middle);
+        assert_eq!(
+            PointerButton::from_linux_code(0x113),
+            PointerButton::Other(0x113)
+        );
+    }
 }

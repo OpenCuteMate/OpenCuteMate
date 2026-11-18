@@ -10,26 +10,22 @@ use serde::{Deserialize, Serialize};
 pub mod logging;
 
 /// Layer-shell layer the overlay surface is placed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Layer {
     /// Above all normal windows and the top layer.
+    #[default]
     Overlay,
     /// Above normal windows, below the overlay layer.
     Top,
 }
 
-impl Default for Layer {
-    fn default() -> Self {
-        Self::Overlay
-    }
-}
-
 /// Layer-shell keyboard interactivity mode (`zwlr_layer_surface_v1`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyboardInteractivity {
     /// No keyboard focus (default). The PoC only needs pointer input.
+    #[default]
     None,
     /// Keyboard focus on demand (layer-shell v4+).
     OnDemand,
@@ -37,14 +33,8 @@ pub enum KeyboardInteractivity {
     Exclusive,
 }
 
-impl Default for KeyboardInteractivity {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 /// `[window]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
     pub layer: Layer,
@@ -66,7 +56,7 @@ impl Default for WindowConfig {
 }
 
 /// `[render]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderConfig {
     /// Frames-per-second cap for the scheduler (compositor vsync still applies).
@@ -77,12 +67,15 @@ pub struct RenderConfig {
 
 impl Default for RenderConfig {
     fn default() -> Self {
-        Self { fps_limit: 60, vsync: true }
+        Self {
+            fps_limit: 60,
+            vsync: true,
+        }
     }
 }
 
 /// `[character]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CharacterConfig {
     /// Reserved for a future model path; unused in the PoC (procedural cube).
@@ -127,7 +120,7 @@ impl Default for CharacterConfig {
 /// position_x = 0.5
 /// position_y = 0.5
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub window: WindowConfig,
@@ -138,8 +131,8 @@ pub struct Config {
 impl Config {
     /// Load configuration from a TOML file.
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
         let cfg: Config = toml::from_str(&text).map_err(ConfigError::Parse)?;
         Ok(cfg)
     }
@@ -170,4 +163,68 @@ pub enum PlatformError {
     Protocol(String),
     #[error("platform failure: {0}")]
     Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_documented_poc_configuration() {
+        let cfg = Config::default();
+        assert_eq!(cfg.window.layer, Layer::Overlay);
+        assert!(cfg.window.click_through);
+        assert_eq!(
+            cfg.window.keyboard_interactivity,
+            KeyboardInteractivity::None
+        );
+        assert_eq!(cfg.render.fps_limit, 60);
+        assert!(cfg.render.vsync);
+        assert_eq!(cfg.character.position_x, 0.5);
+        assert_eq!(cfg.character.position_y, 0.5);
+        assert_eq!(cfg.character.size, 0.4);
+        assert!(!cfg.character.animate);
+    }
+
+    #[test]
+    fn empty_toml_yields_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn toml_overrides_are_applied() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [window]
+            layer = "top"
+            click_through = false
+
+            [render]
+            fps_limit = 30
+            vsync = false
+
+            [character]
+            position_x = 0.25
+            position_y = 0.75
+            size = 0.6
+            animate = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.window.layer, Layer::Top);
+        assert!(!cfg.window.click_through);
+        assert_eq!(cfg.render.fps_limit, 30);
+        assert!(!cfg.render.vsync);
+        assert_eq!(cfg.character.position_x, 0.25);
+        assert_eq!(cfg.character.position_y, 0.75);
+        assert_eq!(cfg.character.size, 0.6);
+        assert!(cfg.character.animate);
+    }
+
+    #[test]
+    fn unknown_layer_value_is_rejected() {
+        let cfg: Result<Config, _> = toml::from_str(r#"window.layer = "bottom""#);
+        assert!(cfg.is_err());
+    }
 }

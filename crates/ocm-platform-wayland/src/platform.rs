@@ -6,13 +6,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ocm_core::{KeyboardInteractivity, Layer, PlatformError};
-use ocm_platform::{
-    MonitorInfo, OverlayParams, OverlaySurface, Platform,
-};
+use ocm_platform::{MonitorInfo, OverlayParams, OverlaySurface, Platform};
 use wayland_client::globals::{registry_queue_init, GlobalList};
-use wayland_client::protocol::{
-    wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat,
-};
+use wayland_client::protocol::{wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat};
 use wayland_client::{Connection, EventQueue, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -39,14 +35,19 @@ impl Platform for WaylandPlatform {
     type Error = PlatformError;
 
     fn connect() -> Result<Self, PlatformError> {
-        let conn = Connection::connect_to_env()
-            .map_err(|e| PlatformError::Connect(e.to_string()))?;
+        let conn =
+            Connection::connect_to_env().map_err(|e| PlatformError::Connect(e.to_string()))?;
         let (globals, queue) = registry_queue_init::<DispatchState>(&conn)
             .map_err(|e| PlatformError::Connect(e.to_string()))?;
         let qh: QueueHandle<DispatchState> = queue.handle();
         let shared = Rc::new(RefCell::new(Shared::new(conn.clone(), qh)));
         let state = DispatchState { shared };
-        let mut me = Self { conn, globals, queue, state };
+        let mut me = Self {
+            conn,
+            globals,
+            queue,
+            state,
+        };
 
         me.log_globals();
         me.discover_monitors()?;
@@ -298,10 +299,7 @@ impl WaylandPlatform {
     }
 }
 
-fn choose_output<'a>(
-    outputs: &'a [OutputRecord],
-    wanted: &str,
-) -> Option<&'a OutputRecord> {
+fn choose_output<'a>(outputs: &'a [OutputRecord], wanted: &str) -> Option<&'a OutputRecord> {
     if outputs.is_empty() {
         return None;
     }
@@ -310,9 +308,6 @@ fn choose_output<'a>(
     }
     outputs
         .iter()
-        .find(|record| {
-            record.monitor.name == wanted
-                || record.monitor.description.contains(wanted)
-        })
+        .find(|record| record.monitor.name == wanted || record.monitor.description.contains(wanted))
         .or(Some(&outputs[0]))
 }

@@ -187,14 +187,12 @@ impl WgpuRenderer {
         }
         .map_err(|e| RendererError::SurfaceCreation(e.to_string()))?;
 
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
         .map_err(|e| RendererError::Adapter(e.to_string()))?;
 
         let adapter_info = adapter.get_info();
@@ -323,9 +321,7 @@ impl WgpuRenderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<Uniforms>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Uniforms>() as u64),
                 },
                 count: None,
             }],
@@ -452,10 +448,26 @@ impl WgpuRenderer {
             usage: wgpu::BufferUsages::INDEX,
         });
         let shadow_vertices = [
-            ShadowVertex { position: [-1.0, -1.0, 0.0], uv: [0.0, 0.0], _pad: [0.0; 3] },
-            ShadowVertex { position: [1.0, -1.0, 0.0], uv: [1.0, 0.0], _pad: [0.0; 3] },
-            ShadowVertex { position: [1.0, 1.0, 0.0], uv: [1.0, 1.0], _pad: [0.0; 3] },
-            ShadowVertex { position: [-1.0, 1.0, 0.0], uv: [0.0, 1.0], _pad: [0.0; 3] },
+            ShadowVertex {
+                position: [-1.0, -1.0, 0.0],
+                uv: [0.0, 0.0],
+                _pad: [0.0; 3],
+            },
+            ShadowVertex {
+                position: [1.0, -1.0, 0.0],
+                uv: [1.0, 0.0],
+                _pad: [0.0; 3],
+            },
+            ShadowVertex {
+                position: [1.0, 1.0, 0.0],
+                uv: [1.0, 1.0],
+                _pad: [0.0; 3],
+            },
+            ShadowVertex {
+                position: [-1.0, 1.0, 0.0],
+                uv: [0.0, 1.0],
+                _pad: [0.0; 3],
+            },
         ];
         let shadow_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
         let shadow_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -519,7 +531,7 @@ impl WgpuRenderer {
     /// Uses the same placement math as `render`, so input regions always
     /// match what is drawn.
     pub fn character_hitbox(&self, scene: &SceneState) -> Hitbox {
-        let placement = self.camera.placement(scene, self.logical);
+        let placement = self.camera.placement(scene);
         Hitbox {
             center_x: placement.hitbox_center_px.0,
             center_y: placement.hitbox_center_px.1,
@@ -536,17 +548,26 @@ impl WgpuRenderer {
                 tex
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
-                return Ok(FrameOutcome { presented: false, skipped: Some("timeout") });
+                return Ok(FrameOutcome {
+                    presented: false,
+                    skipped: Some("timeout"),
+                });
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(FrameOutcome { presented: false, skipped: Some("occluded") });
+                return Ok(FrameOutcome {
+                    presented: false,
+                    skipped: Some("occluded"),
+                });
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 // Size state is driven by layer-shell configure events; the
                 // next Configure/ScaleChanged will reconfigure. Retry soon.
                 tracing::debug!("surface outdated; reconfiguring with last known size");
                 self.surface.configure(&self.device, &self.config);
-                return Ok(FrameOutcome { presented: false, skipped: Some("outdated") });
+                return Ok(FrameOutcome {
+                    presented: false,
+                    skipped: Some("outdated"),
+                });
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 return Err(RendererError::SurfaceLost("surface lost".into()));
@@ -556,7 +577,7 @@ impl WgpuRenderer {
             }
         };
 
-        let placement = self.camera.placement(scene, self.logical);
+        let placement = self.camera.placement(scene);
         let bob_h = if scene.animate {
             placement.world_h * 0.055 * (scene.time * 2.2).sin()
         } else {
@@ -592,7 +613,8 @@ impl WgpuRenderer {
             placement.forward,
         );
 
-        let shadow_strength = 0.42 * (1.0 - (bob_h / (placement.world_h * 0.06)).abs().clamp(0.0, 1.0) * 0.45);
+        let shadow_strength =
+            0.42 * (1.0 - (bob_h / (placement.world_h * 0.06)).abs().clamp(0.0, 1.0) * 0.45);
         let uniforms = Uniforms {
             view_proj: placement.view_proj,
             cube_model,
@@ -604,11 +626,8 @@ impl WgpuRenderer {
                 0.0,
             ],
         };
-        self.queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&uniforms),
-        );
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         let view = frame
             .texture
@@ -666,7 +685,10 @@ impl WgpuRenderer {
         // (wgpu 30 moved present from SurfaceTexture to Queue.)
         self.queue.present(frame);
 
-        Ok(FrameOutcome { presented: true, skipped: None })
+        Ok(FrameOutcome {
+            presented: true,
+            skipped: None,
+        })
     }
 }
 
@@ -756,4 +778,59 @@ fn cube_geometry() -> (Vec<CubeVertex>, Vec<u16>) {
     ];
 
     (vertices, indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hitbox_contains_is_inclusive_at_the_boundary() {
+        let h = Hitbox {
+            center_x: 100.0,
+            center_y: 100.0,
+            radius: 40.0,
+        };
+        assert!(h.contains(100.0, 100.0));
+        assert!(h.contains(140.0, 100.0));
+        assert!(h.contains(
+            100.0 + 40.0 * std::f64::consts::FRAC_1_SQRT_2,
+            100.0 + 40.0 * std::f64::consts::FRAC_1_SQRT_2
+        ));
+        assert!(!h.contains(140.01, 100.0));
+        assert!(!h.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn cube_geometry_is_wellformed() {
+        let (vertices, indices) = cube_geometry();
+        assert_eq!(vertices.len(), 24); // 4 per face, 6 faces
+        assert_eq!(indices.len(), 36); // 2 triangles per face
+        assert!(indices.iter().all(|&i| (i as usize) < vertices.len()));
+        // All six face colors are present exactly four times.
+        let face_colors = [
+            [0.94, 0.38, 0.28],
+            [0.22, 0.62, 0.62],
+            [0.98, 0.80, 0.30],
+            [0.45, 0.32, 0.68],
+            [0.95, 0.60, 0.24],
+            [0.36, 0.70, 0.90],
+        ];
+        for color in face_colors {
+            let count = vertices.iter().filter(|v| v.color == color).count();
+            assert_eq!(count, 4);
+        }
+    }
+
+    #[test]
+    fn format_has_alpha_accepts_the_unorm_family() {
+        for f in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ] {
+            assert!(format_has_alpha(f));
+        }
+        assert!(!format_has_alpha(wgpu::TextureFormat::R8Unorm));
+    }
 }

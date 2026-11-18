@@ -20,9 +20,7 @@ use wayland_client::protocol::{
     wl_seat::{self, WlSeat},
     wl_surface::WlSurface,
 };
-use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
-};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -112,40 +110,27 @@ impl Shared {
 
     /// The effective scale factor for the surface.
     pub fn effective_scale(&self) -> f64 {
-        match self.frac_scale {
-            Some(frac) if frac > 0 => frac as f64 / 120.0,
-            Some(_) => 1.0,
-            None if self.output_scale > 0 => self.output_scale as f64,
-            None => 1.0,
-        }
+        effective_scale(self.frac_scale, self.output_scale)
     }
 
     /// Buffer (device pixel) size for a logical size at the effective scale.
     pub fn buffer_size_for(&self, logical: (u32, u32)) -> (u32, u32) {
-        let scale = self.effective_scale();
-        let is_integer = (scale - scale.round()).abs() < 1e-9;
-        if is_integer {
-            // Integer path: exact multiple via wl_surface buffer scale.
-            let k = scale.round().max(1.0) as u32;
-            (logical.0 * k, logical.1 * k)
-        } else {
-            // Fractional path: ceil; the viewport crops the remainder.
-            (
-                (logical.0 as f64 * scale).ceil() as u32,
-                (logical.1 as f64 * scale).ceil() as u32,
-            )
-        }
+        buffer_size_for(logical, self.effective_scale())
     }
 
     /// Apply the current scale to the surface (buffer scale / viewport).
     /// Idempotent; safe to call whenever scale or logical size changes.
     pub fn apply_scale(&mut self) {
-        let Some((w, h)) = self.logical_size else { return };
+        let Some((w, h)) = self.logical_size else {
+            return;
+        };
         let scale = self.effective_scale();
         if scale <= 0.0 {
             return;
         }
-        let Some(surface) = self.surface.clone() else { return };
+        let Some(surface) = self.surface.clone() else {
+            return;
+        };
         let is_integer = (scale - scale.round()).abs() < 1e-9;
         if is_integer {
             let k = scale.round().max(1.0) as i32;
@@ -164,7 +149,9 @@ impl Shared {
         } else {
             // Compositor lacks viewporter: cannot scale; render at logical
             // size and let the compositor upscale.
-            tracing::warn!("fractional scale {scale} without viewporter support; buffers stay unscaled");
+            tracing::warn!(
+                "fractional scale {scale} without viewporter support; buffers stay unscaled"
+            );
         }
     }
 
@@ -179,7 +166,37 @@ impl Shared {
 
     pub fn push_pointer(&mut self, kind: PointerEventKind) {
         let (x, y) = self.pointer_pos;
-        self.pending.push(PlatformEvent::Pointer(PointerEvent { kind, x, y }));
+        self.pending
+            .push(PlatformEvent::Pointer(PointerEvent { kind, x, y }));
+    }
+}
+
+/// Effective scale factor from the two protocol sources: the fractional
+/// scale (`wp_fractional_scale_v1.preferred_scale`, units of 1/120) when
+/// the compositor supports it, otherwise the integer `wl_output.scale`.
+pub(crate) fn effective_scale(frac_scale: Option<u32>, output_scale: i32) -> f64 {
+    match frac_scale {
+        Some(frac) if frac > 0 => frac as f64 / 120.0,
+        Some(_) => 1.0,
+        None if output_scale > 0 => output_scale as f64,
+        None => 1.0,
+    }
+}
+
+/// Buffer (device pixel) size for a logical size at a scale factor.
+///
+/// Integer scales are exact multiples (applied via `wl_surface` buffer
+/// scale); fractional sizes round up and the viewport crops the remainder.
+pub(crate) fn buffer_size_for(logical: (u32, u32), scale: f64) -> (u32, u32) {
+    let is_integer = (scale - scale.round()).abs() < 1e-9;
+    if is_integer {
+        let k = scale.round().max(1.0) as u32;
+        (logical.0 * k, logical.1 * k)
+    } else {
+        (
+            (logical.0 as f64 * scale).ceil() as u32,
+            (logical.1 as f64 * scale).ceil() as u32,
+        )
     }
 }
 
@@ -281,14 +298,15 @@ impl Dispatch<ZxdgOutputV1, OutputData> for DispatchState {
         _qh: &QueueHandle<Self>,
     ) {
         let mut shared = state.shared.borrow_mut();
-        let Some(record) = shared.outputs.get_mut(data.index) else { return };
+        let Some(record) = shared.outputs.get_mut(data.index) else {
+            return;
+        };
         match event {
             zxdg_output_v1::Event::LogicalPosition { x, y } => {
                 record.monitor.logical_position = Some((x, y));
             }
             zxdg_output_v1::Event::LogicalSize { width, height } => {
-                record.monitor.logical_size =
-                    Some((width.max(0) as u32, height.max(0) as u32));
+                record.monitor.logical_size = Some((width.max(0) as u32, height.max(0) as u32));
             }
             zxdg_output_v1::Event::Name { name } => {
                 record.monitor.name = name;
@@ -312,7 +330,9 @@ impl Dispatch<WlOutput, OutputData> for DispatchState {
     ) {
         use wayland_client::protocol::wl_output;
         let mut shared = state.shared.borrow_mut();
-        let Some(record) = shared.outputs.get_mut(data.index) else { return };
+        let Some(record) = shared.outputs.get_mut(data.index) else {
+            return;
+        };
         match event {
             wl_output::Event::Scale { factor } => {
                 record.monitor.scale = factor;
@@ -339,7 +359,11 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for DispatchState {
     ) {
         let mut shared = state.shared.borrow_mut();
         match event {
-            zwlr_layer_surface_v1::Event::Configure { width, height, serial } => {
+            zwlr_layer_surface_v1::Event::Configure {
+                width,
+                height,
+                serial,
+            } => {
                 // Ack immediately: legal "sometime before the commit" that
                 // responds to this configure (which our next present is).
                 proxy.ack_configure(serial);
@@ -348,7 +372,9 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for DispatchState {
                 tracing::info!(width, height, "layer surface configured");
                 shared.logical_size = Some((width, height));
                 shared.apply_scale();
-                shared.pending.push(PlatformEvent::Configure { width, height });
+                shared
+                    .pending
+                    .push(PlatformEvent::Configure { width, height });
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 tracing::info!("layer surface closed by compositor");
@@ -369,19 +395,17 @@ impl Dispatch<WlSeat, ()> for DispatchState {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_seat::Event::Capabilities { capabilities } => {
-                if let WEnum::Value(caps) = capabilities {
-                    if caps.contains(wl_seat::Capability::Pointer) {
-                        let mut shared = state.shared.borrow_mut();
-                        if shared.pointer.is_none() {
-                            tracing::debug!("seat has pointer capability; binding wl_pointer");
-                            shared.pointer = Some(proxy.get_pointer(qh, ()));
-                        }
-                    }
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
+            if caps.contains(wl_seat::Capability::Pointer) {
+                let mut shared = state.shared.borrow_mut();
+                if shared.pointer.is_none() {
+                    tracing::debug!("seat has pointer capability; binding wl_pointer");
+                    shared.pointer = Some(proxy.get_pointer(qh, ()));
                 }
             }
-            _ => {}
         }
     }
 }
@@ -397,7 +421,11 @@ impl Dispatch<WlPointer, ()> for DispatchState {
     ) {
         let mut shared = state.shared.borrow_mut();
         match event {
-            wl_pointer::Event::Enter { surface_x, surface_y, .. } => {
+            wl_pointer::Event::Enter {
+                surface_x,
+                surface_y,
+                ..
+            } => {
                 shared.pointer_pos = (surface_x, surface_y);
                 tracing::debug!(x = surface_x, y = surface_y, "pointer enter");
                 shared.push_pointer(PointerEventKind::Enter);
@@ -406,11 +434,19 @@ impl Dispatch<WlPointer, ()> for DispatchState {
                 tracing::debug!("pointer leave");
                 shared.push_pointer(PointerEventKind::Leave);
             }
-            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
                 shared.pointer_pos = (surface_x, surface_y);
                 shared.push_pointer(PointerEventKind::Motion);
             }
-            wl_pointer::Event::Button { button, state: press_state, .. } => {
+            wl_pointer::Event::Button {
+                button,
+                state: press_state,
+                ..
+            } => {
                 let button = PointerButton::from_linux_code(button);
                 let kind = match press_state {
                     WEnum::Value(wl_pointer::ButtonState::Pressed) => {
@@ -428,7 +464,7 @@ impl Dispatch<WlPointer, ()> for DispatchState {
                 tracing::debug!(?button, ?kind, "pointer button");
                 shared.push_pointer(kind);
             }
-            wl_pointer::Event::Frame { .. } => {
+            wl_pointer::Event::Frame => {
                 // Batching boundary; our reactions are idempotent.
             }
             _ => {}
@@ -504,5 +540,39 @@ impl Dispatch<WpViewport, ()> for DispatchState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fractional_scale_wins_over_integer_output_scale() {
+        // The dev machine: 1.25× reported as 150 units of 1/120.
+        assert_eq!(effective_scale(Some(150), 1), 1.25);
+        assert_eq!(effective_scale(Some(120), 2), 1.0);
+    }
+
+    #[test]
+    fn degenerate_fractional_scale_falls_back() {
+        assert_eq!(effective_scale(Some(0), 2), 1.0);
+        assert_eq!(effective_scale(None, 2), 2.0);
+        assert_eq!(effective_scale(None, 0), 1.0);
+        assert_eq!(effective_scale(None, -1), 1.0);
+    }
+
+    #[test]
+    fn integer_scale_multiplies_exactly() {
+        assert_eq!(buffer_size_for((1536, 864), 1.0), (1536, 864));
+        assert_eq!(buffer_size_for((1536, 864), 2.0), (3072, 1728));
+    }
+
+    #[test]
+    fn fractional_scale_rounds_up() {
+        // 1536×864 logical at 1.25× = 1920×1080 device pixels (the
+        // viewport crops the ceil remainder on other sizes).
+        assert_eq!(buffer_size_for((1536, 864), 1.25), (1920, 1080));
+        assert_eq!(buffer_size_for((100, 101), 1.25), (125, 127));
     }
 }

@@ -9,8 +9,8 @@ use tracing_subscriber::EnvFilter;
 /// Honors `RUST_LOG` (e.g. `RUST_LOG=ocm_runtime=debug,info`); when unset,
 /// uses `default_level` (e.g. `"info"`).
 pub fn init(default_level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

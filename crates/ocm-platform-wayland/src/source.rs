@@ -10,9 +10,7 @@ use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 use calloop::generic::Generic;
-use calloop::{
-    Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory,
-};
+use calloop::{Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 use ocm_platform::PlatformEvent;
 use wayland_client::{Connection, EventQueue};
 
@@ -97,8 +95,7 @@ impl calloop::EventSource for WaylandSource {
                 .dispatch_pending(&mut self.state)
                 .map_err(|e| SourceError::Dispatch(e.to_string()))?;
             // 4. Emit platform events to the loop callback.
-            let events: Vec<PlatformEvent> =
-                self.shared.borrow_mut().pending.drain(..).collect();
+            let events: Vec<PlatformEvent> = std::mem::take(&mut self.shared.borrow_mut().pending);
             for event in events {
                 callback(event, &mut ());
             }

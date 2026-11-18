@@ -47,18 +47,14 @@ impl OverlaySurface for WaylandOverlay {
         //    which is after the renderer drop in the teardown sequence).
         let display_ptr = conn.backend().display_ptr();
         let surface_ptr = surface.id().as_ptr();
-        let display = RawDisplayHandle::Wayland(
-            WaylandDisplayHandle::new(
-                NonNull::new(display_ptr.cast::<std::ffi::c_void>())
-                    .expect("wl_display pointer is non-null"),
-            ),
-        );
-        let window = RawWindowHandle::Wayland(
-            WaylandWindowHandle::new(
-                NonNull::new(surface_ptr.cast::<std::ffi::c_void>())
-                    .expect("wl_surface pointer is non-null"),
-            ),
-        );
+        let display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+            NonNull::new(display_ptr.cast::<std::ffi::c_void>())
+                .expect("wl_display pointer is non-null"),
+        ));
+        let window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+            NonNull::new(surface_ptr.cast::<std::ffi::c_void>())
+                .expect("wl_surface pointer is non-null"),
+        ));
         NativeHandles { display, window }
     }
 
@@ -78,12 +74,16 @@ impl OverlaySurface for WaylandOverlay {
 
     fn set_input_region(&self, rects: Option<&[Rect]>) {
         let s = self.shared.borrow();
-        let Some(surface) = s.surface.clone() else { return };
+        let Some(surface) = s.surface.clone() else {
+            return;
+        };
         match rects {
             // None = infinite input region: the whole surface is interactive.
             None => surface.set_input_region(None::<&WlRegion>),
             Some(rects) => {
-                let Some(compositor) = s.compositor.clone() else { return };
+                let Some(compositor) = s.compositor.clone() else {
+                    return;
+                };
                 let region = compositor.create_region(&s.qh, ());
                 for rect in rects {
                     region.add(rect.x, rect.y, rect.width, rect.height);
@@ -107,7 +107,9 @@ impl OverlaySurface for WaylandOverlay {
         if s.frame_armed {
             return false;
         }
-        let Some(surface) = s.surface.clone() else { return false };
+        let Some(surface) = s.surface.clone() else {
+            return false;
+        };
         // The callback latches onto the next commit (the present that
         // follows the next render). User data is `()`: the shared
         // Dispatch<WlCallback, ()> implementation emits Frame events.

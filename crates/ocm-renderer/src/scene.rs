@@ -67,16 +67,20 @@ impl Camera {
         // t = f·(ref − eye) / (f·dir), and f·dir = f·f = 1 for our ray
         // construction (dir = f + right·x + up·y with orthogonal basis).
         let anchor_ref: Vec3 = [0.0, 0.55, 0.0];
-        let anchor_distance = math::dot(
-            forward,
-            math::sub(anchor_ref, EYE),
-        );
+        let anchor_distance = math::dot(forward, math::sub(anchor_ref, EYE));
 
-        Self { view_proj, right, up, forward, anchor_distance, logical }
+        Self {
+            view_proj,
+            right,
+            up,
+            forward,
+            anchor_distance,
+            logical,
+        }
     }
 
     /// Compute the full placement for a scene snapshot.
-    pub fn placement(&self, scene: &SceneState, logical: (u32, u32)) -> Placement {
+    pub fn placement(&self, scene: &SceneState) -> Placement {
         // NDC point for the normalized position (top-left origin in input,
         // NDC y points up).
         let ndc_x = scene.position.0 as f32 * 2.0 - 1.0;
@@ -130,8 +134,6 @@ impl Camera {
             scene.position.1 as f32 * self.logical.1 as f32,
         );
 
-        let _ = logical; // camera is already framed for the right size
-
         Placement {
             view_proj: self.view_proj,
             center,
@@ -142,5 +144,64 @@ impl Camera {
             hitbox_center_px,
             hitbox_radius_px,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scene(u: f64, v: f64, size_frac: f32) -> SceneState {
+        SceneState {
+            position: (u, v),
+            size_frac,
+            hover: false,
+            animate: false,
+            time: 0.0,
+        }
+    }
+
+    /// The anchor-plane contract: the character anchor maps to exactly
+    /// (u·W, v·H) logical pixels, so the input-region hitbox always covers
+    /// what is drawn on screen.
+    #[test]
+    fn hitbox_center_maps_position_exactly() {
+        for (w, h) in [(1536, 864), (1920, 1080)] {
+            let camera = Camera::new((w, h));
+            for (u, v) in [(0.5, 0.55), (0.22, 0.30), (0.0, 1.0), (1.0, 0.0)] {
+                let p = camera.placement(&scene(u, v, 0.4));
+                assert_eq!(p.hitbox_center_px.0, u as f32 * w as f32);
+                assert_eq!(p.hitbox_center_px.1, v as f32 * h as f32);
+            }
+        }
+    }
+
+    /// The anchor always lies on the screen-parallel plane at the fixed
+    /// camera distance — the invariant that makes the pixel mapping exact.
+    #[test]
+    fn anchor_lies_on_the_anchor_plane() {
+        let camera = Camera::new((1536, 864));
+        for (u, v) in [(0.1, 0.1), (0.5, 0.5), (0.9, 0.8)] {
+            let p = camera.placement(&scene(u, v, 0.4));
+            let d = math::dot(math::sub(p.center, EYE), camera.forward);
+            assert!((d - camera.anchor_distance).abs() < 1e-3, "d = {d}");
+        }
+    }
+
+    #[test]
+    fn hitbox_radius_scales_with_character_size() {
+        let camera = Camera::new((1536, 864));
+        let small = camera.placement(&scene(0.5, 0.5, 0.1)).hitbox_radius_px;
+        let large = camera.placement(&scene(0.5, 0.5, 0.8)).hitbox_radius_px;
+        assert!(small > 0.0);
+        assert!((large / small - 8.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn world_height_scales_with_character_size() {
+        let camera = Camera::new((1536, 864));
+        let small = camera.placement(&scene(0.5, 0.5, 0.1)).world_h;
+        let large = camera.placement(&scene(0.5, 0.5, 0.2)).world_h;
+        assert!((large / small - 2.0).abs() < 1e-3);
     }
 }
