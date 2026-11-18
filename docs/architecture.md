@@ -256,10 +256,13 @@ FPS cap: enforced by deferring renders that arrive too soon with a one-shot
 which wgpu documents as gracefully falling back
 ([Verified] `wgpu-types-30.0.2/src/surface.rs:28-40`).
 
-Frame-callback ordering: the callback is requested **before** the present that
-follows the render, so the request latches onto that commit (protocol:
-"will take effect on the next `wl_surface.commit`"; wgpu's present performs the
-commit via the Vulkan WSI).
+Frame-callback ordering: the callback is requested **before** the render
+that follows, so it latches onto that render's present-commit (protocol:
+"will take effect on the next `wl_surface.commit`"; wgpu's present performs
+the commit via the Vulkan WSI). It then fires once the compositor has
+consumed that frame. (Requesting after the present would leave the request
+pending with no commit to latch onto — a real bug the automated suite
+caught: the app could never park without external input.)
 
 Why renders stop naturally in event-driven mode: after the last render we arm
 exactly one more frame callback; when it fires with nothing dirty we do not

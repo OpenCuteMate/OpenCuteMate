@@ -15,5 +15,7 @@ pub fn init(default_level: &str) {
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
+        // No ANSI: logs are piped to files and grepped by the test suite.
+        .with_ansi(false)
         .init();
 }

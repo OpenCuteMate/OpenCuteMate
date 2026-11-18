@@ -106,16 +106,18 @@ impl App {
     /// Encode + present one frame, then arm a frame callback.
     fn render_now(&mut self) {
         let scene = self.scene();
+        // Request the frame callback BEFORE presenting: a wl_surface.frame
+        // request latches onto the next commit, and the present in
+        // renderer.render() is that commit. The callback then fires when the
+        // compositor has consumed this frame — the correct pacing signal.
+        // (Requesting it after present would leave it pending forever.)
+        self.overlay.request_frame();
         match self.renderer.render(&scene) {
             Ok(FrameOutcome { presented: true, .. }) => {
                 self.frames += 1;
                 self.last_present = Instant::now();
                 self.dirty = false;
                 self.idle_logged = false;
-                // Request the next pacing signal *after* present: the
-                // callback latches onto the next commit and fires when the
-                // compositor has consumed this frame.
-                self.overlay.request_frame();
                 if self.mode == RenderMode::Idle {
                     self.mode = RenderMode::EventDriven;
                 }

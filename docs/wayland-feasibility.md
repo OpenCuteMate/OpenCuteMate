@@ -317,16 +317,14 @@ start drawing a new frame … The frame request will take effect on the next
 The PoC's per-render sequence:
 
 ```text
-render (CPU+GPU) → present (WSI attaches buffer + commits)
-  → request frame callback (latches onto *next* commit)
-  → callback fires (compositor processed the new frame / next repaint)
+request frame callback → render (CPU+GPU) → present (WSI attaches buffer + commits)
+  → callback latched onto that commit fires when the compositor consumed it
   → decide: render again (dirty/animated) or park (idle)
 ```
 
-Requesting the callback *after* present means it is delivered after the
-compositor has consumed the presented buffer — the correct pacing signal.
-[Verified empirically in the PoC: callback cadence tracks the compositor's
-output refresh.]
+The callback is requested *before* the render whose commit it must latch
+onto. [Verified empirically in the PoC: callback cadence tracks the
+compositor's output refresh.]
 
 ### 5.2 Interaction with wgpu presentation
 
