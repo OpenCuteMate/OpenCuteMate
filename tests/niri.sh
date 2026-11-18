@@ -97,6 +97,31 @@ done
 NIRI_SOCKET="$IPCSOCK" niri msg outputs >/dev/null 2>&1 || { bad "nested niri not responding"; exit 1; }
 ok "nested niri running"
 
+# Focus the nested compositor's toplevel on the HOST session. Niri only drives
+# unfocused/occluded windows at ~0.5 Hz, which batches the virtual-pointer
+# input delivered to the nested instance and breaks the wall-clock-timed
+# sections below. Focusing the window (title "niri") makes the host drive it
+# in real time. This is the one host-visible side effect of the suite: your
+# keyboard focus moves to the test window for the duration of the run.
+# (NIRI_SOCKET is unset here on purpose: this talks to the HOST compositor.)
+HOST_NIRI_WIN=""
+for _ in $(seq 1 30); do
+  HOST_NIRI_WIN=$(niri msg --json windows 2>/dev/null | python3 -c '
+import json, sys
+ws = json.load(sys.stdin)
+w = next((w for w in ws if w["title"] == "niri"), None)
+print(w["id"] if w else "")' )
+  [ -n "$HOST_NIRI_WIN" ] && break
+  sleep 0.2
+done
+if [ -n "$HOST_NIRI_WIN" ]; then
+  niri msg action focus-window --id "$HOST_NIRI_WIN" >/dev/null 2>&1 \
+    && ok "nested compositor focused on the host (real-time frame pacing)" \
+    || note "could not focus the nested window on the host (run may be throttled)"
+else
+  note "nested niri window not found on the host (run may be throttled)"
+fi
+
 # Nested output logical size (screenshot + injection coordinate space).
 read -r OUT_W OUT_H <<<"$(NIRI_SOCKET="$IPCSOCK" niri msg --json outputs | python3 -c '
 import json,sys
@@ -233,6 +258,19 @@ else
   bad "empty-area click reached the app (input region broken)"
 fi
 
+# Wait until the app has logged a pattern (input delivery through the
+# nested compositor can lag the script; polls instead of fixed sleeps).
+wait_log() {
+  # wait_log <pattern> <max_seconds>
+  local pattern=$1 max=$2 i
+  for i in $(seq 1 $((max * 4))); do
+    grep -q "$pattern" "$APP_LOG" && return 0
+    kill -0 "$APP_PID" 2>/dev/null || return 1
+    sleep 0.25
+  done
+  return 1
+}
+
 # Drag the cube from (0.5, 0.55) to (0.22, 0.3).
 say "dragging the character to (0.22, 0.3)"
 inj move "$CUBE_A_X" "$CUBE_A_Y" "$OUT_W" "$OUT_H"
@@ -249,22 +287,30 @@ for f in 0.44 0.38 0.34 0.30; do
 done
 sleep 0.2
 inj up 0x110
-sleep 0.8
 
 grep -q "drag started" "$APP_LOG" \
   && ok "drag started (press inside hitbox)" \
   || bad "no drag start in app log"
-grep -q "drag ended" "$APP_LOG" \
+wait_log "drag ended" 15 \
   && ok "drag ended (input region followed the character)" \
   || bad "no drag end in app log"
 
-# Screenshot after the drag: the cube must be at (0.22, 0.3) now.
-rm -f "$WORK/screen.png"
-NIRI_SOCKET="$IPCSOCK" niri msg action screenshot-screen
-for _ in $(seq 1 40); do [ -s "$WORK/screen.png" ] && break; sleep 0.2; done
-python3 tests/analyze_screenshot.py "$WORK/screen.png" "$OUT_W" "$OUT_H" 0.22 0.30 0.4 >/dev/null 2>&1 \
-  && ok "cube followed the drag to (0.22, 0.3) (pixel-verified)" \
-  || bad "cube did not follow the drag (pixel check at new position failed)"
+# Screenshot after the drag: the cube must be at (0.22, 0.3) now. Allow a
+# short retry: the final present may lag the input by one frame-callback
+# cycle when the nested compositor is throttled.
+DRAG_PIXELS=1
+for _ in 1 2 3; do
+  rm -f "$WORK/screen.png"
+  NIRI_SOCKET="$IPCSOCK" niri msg action screenshot-screen
+  for _ in $(seq 1 40); do [ -s "$WORK/screen.png" ] && break; sleep 0.2; done
+  python3 tests/analyze_screenshot.py "$WORK/screen.png" "$OUT_W" "$OUT_H" 0.22 0.30 0.4 >/dev/null 2>&1 && { DRAG_PIXELS=0; break; }
+  sleep 1
+done
+if [ "$DRAG_PIXELS" -eq 0 ]; then
+  ok "cube followed the drag to (0.22, 0.3) (pixel-verified)"
+else
+  bad "cube did not follow the drag (pixel check at new position failed)"
+fi
 
 # --- right-click quit --------------------------------------------------------------
 say "right-click on the character -> quit"
