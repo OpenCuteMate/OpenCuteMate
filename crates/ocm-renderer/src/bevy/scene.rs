@@ -29,13 +29,10 @@ pub(crate) struct SceneEntities {
     pub(crate) shadow: Entity,
     /// (element entity, element id) pairs.
     pub(crate) elements: Vec<(Entity, ocm_character::ElementId)>,
-    /// (part entity, its material, its element id, base sRGB color).
-    pub(crate) parts: Vec<(
-        Entity,
-        Handle<StandardMaterial>,
-        ocm_character::ElementId,
-        [f32; 3],
-    )>,
+    /// (part material, its element id, base sRGB color). Part entities
+    /// are static (local transform never changes — element poses scale
+    /// the element entities), so only the materials are updated per frame.
+    pub(crate) parts: Vec<(Handle<StandardMaterial>, ocm_character::ElementId, [f32; 3])>,
     /// The shadow material (strength follows the bob each frame).
     pub(crate) shadow_material: Handle<StandardMaterial>,
 }
@@ -170,7 +167,7 @@ pub(crate) fn spawn_scene(
             .id();
         elements.push((element_entity, element_id));
         for spec in part_specs {
-            let part_entity = world
+            let _part_entity = world
                 .spawn((
                     Mesh3d(part_mesh.clone()),
                     MeshMaterial3d(spec.material.clone()),
@@ -182,7 +179,7 @@ pub(crate) fn spawn_scene(
                     ChildOf(element_entity),
                 ))
                 .id();
-            parts.push((part_entity, spec.material, element_id, spec.base_color));
+            parts.push((spec.material, element_id, spec.base_color));
         }
     }
 
@@ -296,7 +293,7 @@ pub(crate) fn sync_scene(
     // Part tints: base × pose tint × hover.
     {
         let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
-        for (entity, material, element_id, base_color) in &entities.parts {
+        for (material, element_id, base_color) in &entities.parts {
             let mut tint = state.pose.element(*element_id).tint;
             if state.hover == Some(*element_id) {
                 tint = [
@@ -318,7 +315,6 @@ pub(crate) fn sync_scene(
             if mat.base_color != target {
                 mat.base_color = target;
             }
-            let _ = entity;
         }
     }
 
