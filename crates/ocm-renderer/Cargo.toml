@@ -6,13 +6,42 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["wgpu-backend", "bevy-backend"]
+# The validated Phase 2 renderer (wgpu-direct; regression reference).
+wgpu-backend = []
+# The Bevy 0.20 render integration (docs/bevy-integration.md).
+bevy-backend = ["dep:bevy"]
+
 [dependencies]
 ocm-core.workspace = true
 ocm-platform.workspace = true
-wgpu.workspace = true
 raw-window-handle.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
-# Blocking executor for wgpu's async adapter/device requests; tiny and Tokio-free.
+
+# Both backends drive wgpu directly (Bevy itself renders through the same
+# pinned wgpu version).
+wgpu.workspace = true
+# Blocking executor for the async adapter/device requests; tiny and Tokio-free.
 pollster = "0.4"
+
+# Bevy backend: render stack only — no winit, no X11, no clipboard, no
+# gamepad (see docs/bevy-integration.md §2). Composed feature-by-feature
+# instead of `3d_bevy_render` to keep gizmos, glTF, post-processing and
+# anti-aliasing out of the dependency graph. Vulkan is selected via
+# RenderPlugin settings in code.
+bevy = { workspace = true, optional = true, default-features = false, features = [
+    "bevy_render",
+    "bevy_camera",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_light",
+    "bevy_material",
+    "bevy_mesh",
+    "bevy_image",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_window",
+] }

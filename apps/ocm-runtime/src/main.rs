@@ -13,7 +13,7 @@ use ocm_core::logging;
 use ocm_core::{Config, Layer, PlatformError};
 use ocm_platform::{OverlaySurface, Platform, PlatformEvent, PointerEventKind, Rect};
 use ocm_platform_wayland::WaylandPlatform;
-use ocm_renderer::{FrameOutcome, Hitbox, RenderOpts, SceneState, WgpuRenderer};
+use ocm_renderer::{FrameOutcome, Hitbox, RenderOpts, Renderer, SceneState};
 
 /// Frame pacing / scheduler state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +28,7 @@ enum RenderMode {
 
 struct App {
     overlay: ocm_platform_wayland::WaylandOverlay,
-    renderer: WgpuRenderer,
+    renderer: Box<dyn Renderer>,
     config: Config,
     /// Character state (normalized position etc.).
     character: CharacterState,
@@ -356,6 +356,10 @@ struct Args {
     /// Log level filter (trace, debug, info, warn, error). RUST_LOG wins.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Rendering backend: "wgpu" (default) or "bevy".
+    #[arg(long, value_name = "NAME")]
+    renderer: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -462,21 +466,82 @@ fn main() -> ExitCode {
     let render_opts = RenderOpts {
         vsync: config.render.vsync,
     };
-    let renderer = match WgpuRenderer::new(
-        &overlay.native_handles(),
-        overlay.logical_size(),
-        overlay.buffer_size(),
-        &render_opts,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("failed to initialize renderer: {e}");
-            // Drop the renderer-less app before the platform (teardown order).
+    let backend = args.renderer.as_deref().unwrap_or("wgpu");
+    let renderer: Box<dyn Renderer> = match backend {
+        "wgpu" => {
+            #[cfg(feature = "renderer-wgpu")]
+            {
+                Box::new(
+                    match ocm_renderer::WgpuRenderer::new(
+                        &overlay.native_handles(),
+                        overlay.logical_size(),
+                        overlay.buffer_size(),
+                        &render_opts,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("failed to initialize wgpu renderer: {e}");
+                            // Drop the renderer-less app before the platform
+                            // (teardown order).
+                            drop(overlay);
+                            drop(platform);
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                )
+            }
+            #[cfg(not(feature = "renderer-wgpu"))]
+            {
+                eprintln!("this binary was built without the wgpu backend");
+                drop(overlay);
+                drop(platform);
+                return ExitCode::FAILURE;
+            }
+        }
+        "bevy" => {
+            #[cfg(feature = "renderer-bevy")]
+            {
+                Box::new(
+                    match ocm_renderer::BevyRenderer::new(
+                        &overlay.native_handles(),
+                        overlay.logical_size(),
+                        overlay.buffer_size(),
+                        &render_opts,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("failed to initialize bevy renderer: {e}");
+                            drop(overlay);
+                            drop(platform);
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                )
+            }
+            #[cfg(not(feature = "renderer-bevy"))]
+            {
+                eprintln!(
+                    "this binary was built without the bevy backend \
+                           (build with --features renderer-bevy)"
+                );
+                drop(overlay);
+                drop(platform);
+                return ExitCode::FAILURE;
+            }
+        }
+        other => {
+            eprintln!(
+                "unknown renderer {other:?}; expected \"wgpu\" or \"bevy\" \
+                 (built backends: wgpu={}, bevy={})",
+                cfg!(feature = "renderer-wgpu"),
+                cfg!(feature = "renderer-bevy")
+            );
             drop(overlay);
             drop(platform);
             return ExitCode::FAILURE;
         }
     };
+    tracing::info!(backend, "renderer initialized");
 
     // ---- Main loop ---------------------------------------------------------------
     let mut loop_ = match EventLoop::try_new() {

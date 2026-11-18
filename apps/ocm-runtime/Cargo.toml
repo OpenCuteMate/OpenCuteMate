@@ -10,6 +10,11 @@ repository.workspace = true
 name = "ocm-runtime"
 path = "src/main.rs"
 
+[features]
+default = ["renderer-wgpu", "renderer-bevy"]
+renderer-wgpu = ["ocm-renderer/wgpu-backend"]
+renderer-bevy = ["ocm-renderer/bevy-backend"]
+
 [dependencies]
 ocm-core.workspace = true
 ocm-platform.workspace = true

@@ -15,12 +15,12 @@ use crate::SceneState;
 
 /// Fixed camera parameters. A slight downward tilt makes the cube read as
 /// 3D while keeping the anchor-plane math exact.
-const EYE: Vec3 = [0.0, 2.6, 5.4];
-const TARGET: Vec3 = [0.0, 0.55, 0.0];
+pub(crate) const EYE: Vec3 = [0.0, 2.6, 5.4];
+pub(crate) const TARGET: Vec3 = [0.0, 0.55, 0.0];
 const UP: Vec3 = [0.0, 1.0, 0.0];
-const FOV_Y: f32 = 30.0_f32.to_radians();
-const NEAR: f32 = 0.1;
-const FAR: f32 = 100.0;
+pub(crate) const FOV_Y: f32 = 30.0_f32.to_radians();
+pub(crate) const NEAR: f32 = 0.1;
+pub(crate) const FAR: f32 = 100.0;
 
 /// A point on the anchor plane, and its screen-parallel placement data.
 #[derive(Debug, Clone, Copy)]

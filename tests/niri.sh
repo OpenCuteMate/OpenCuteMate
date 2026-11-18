@@ -15,13 +15,20 @@
 #
 # Requires: cargo, niri, python3+PIL, magick. No root, no uinput.
 #
-# usage: tests/niri.sh [--keep]   (keep the work dir for inspection)
+# usage: tests/niri.sh [--keep]           (keep the work dir for inspection)
+#        OCM_RENDERER=bevy tests/niri.sh  (run against the Bevy backend;
+#                                          default is wgpu)
 
 set -u
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 KEEP=${1:-}
+OCM_RENDERER=${OCM_RENDERER:-wgpu}
+case "$OCM_RENDERER" in
+  wgpu|bevy) ;;
+  *) echo "OCM_RENDERER must be wgpu or bevy (got: $OCM_RENDERER)"; exit 2 ;;
+esac
 WORK=$(mktemp -d /tmp/opencode/ocm-niri-XXXXXX)
 APP="$REPO/target/debug/ocm-runtime"
 PASS=0
@@ -141,9 +148,10 @@ exec 3> "$WORK/inject.in" || { bad "could not open injector fifo"; kill "$INJECT
 sleep 0.3
 inj() { echo "$*" >&3; }
 
-say "launching ocm-runtime against the nested compositor (default config: click-through on)"
+say "launching ocm-runtime (renderer: $OCM_RENDERER) against the nested compositor (default config: click-through on)"
 APP_LOG="$WORK/app.log"
-WAYLAND_DISPLAY="$WLSOCK" RUST_LOG="debug,naga=warn,wgpu=warn" "$APP" \
+WAYLAND_DISPLAY="$WLSOCK" RUST_LOG="debug,naga=warn,wgpu=warn,bevy=warn,bevy_render=warn,bevy_pbr=warn,bevy_winit=warn" "$APP" \
+  --renderer "$OCM_RENDERER" \
   --position 0.5,0.55 --size 0.4 --fps 60 > "$APP_LOG" 2>&1 &
 APP_PID=$!
 
@@ -227,6 +235,8 @@ if python3 tests/analyze_screenshot.py "$WORK/screen.png" "$OUT_W" "$OUT_H" 0.5 
   cp "$WORK/screen.png" "$REPO/target/niri-validation.png" 2>/dev/null
 else
   bad "pixel analysis failed (see details above)"
+  # Preserve the failing screenshot for offline analysis.
+  cp "$WORK/screen.png" "$REPO/target/niri-failure.png" 2>/dev/null
 fi
 
 # --- input automation via zwlr_virtual_pointer (host untouched) -------------------

@@ -26,6 +26,10 @@ calloop = "0.14"
 # Graphics (Vulkan-only surface for the PoC; exact version locked by Cargo.lock)
 wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl", "std"] }
 
+# Engine (Phase 2b Bevy backend; render-stack features only, selected in
+# ocm-renderer — winit/X11 stay out of the dependency graph)
+bevy = { version = "0.20.1", default-features = false }
+
 # Config & CLI
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -46,3 +50,15 @@ ocm-renderer = { path = "crates/ocm-renderer" }
 
 [profile.release]
 opt-level = 2
+
+[profile.dev]
+# Incremental caches double target-dir size; the regression suites build
+# from scratch anyway.
+incremental = false
+
+[profile.dev.package."*"]
+# Dependency debug info dominates the target directory once the Bevy
+# backend is enabled (multi-GB). Line tables keep backtraces symbolized
+# and line-attributed through dependencies; workspace crates keep full
+# debug info (they inherit profile.dev.debug = true).
+debug = "line-tables-only"
