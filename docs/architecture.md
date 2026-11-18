@@ -40,43 +40,58 @@ Hard constraints derived from the approved plan:
                     │                    │  logging init (tracing)
                     └────────▲───────────┘
                              │
-        ┌────────────────────┼───────────────────────┐
-        │                    │                       │
-┌───────┴────────┐   ┌───────┴────────┐      ┌───────┴─────────────┐
-│ ocm-platform   │   │ ocm-renderer   │      │ ocm-platform-wayland│
-│ (abstraction)  │   │ (wgpu, Vulkan) │      │ (Wayland client)    │
-│ traits, events │   │ cube, alpha,   │      │ layer-shell, input, │
-│ rwh handles    │   │ frame pacing   │      │ outputs, dispatch   │
-└───▲────────▲───┘   └───────▲────────┘      └───────▲─────────────┘
-    │        │               │                       │
-    │        └───────────────┼───────────────────────│
-    │                        │                       │
-┌───┴────────────────────────┴───────────────────────┴──────────┐
+        ┌────────────────────┼───────────────────┐
+        │                    │                   │
+┌───────┴────────┐   ┌───────┴────────┐  ┌───────┴──────────────────┐
+│ ocm-platform   │   │ ocm-renderer  │  │ ocm-platform-wayland     │
+│ (abstraction)  │   │ wgpu 30 +      │  │ (Wayland client)        │
+│ traits, events │   │ Bevy 0.20,     │  │ layer-shell, input,     │
+│ rwh handles    │   │ one Renderer   │  │ outputs, dispatch       │
+└───▲────────▲───┘   │ contract       │  └──────────▲─────────────┘
+    │        │       └───▲────────────┘             │
+    │        │           │                          │
+    │   ┌────┴───────────┴───┐                      │
+    │   │ ocm-character      │ (Phase 3a)          │
+    │   │ model, state        │                     │
+    │   │ machine, physics,   │                     │
+    │   │ interaction,        │                     │
+    │   │ animation           │                     │
+    │   └────────────────────┘                     │
+    │        model + pose types flow to ocm-renderer│
+┌───┴────────────────────────┴──────────────────────┴───────────┐
 │                        ocm-runtime                            │
-│  CLI (clap), config loading, platform init, renderer init,    │
-│  main loop (calloop), scheduler, teardown ordering            │
-└───────────────────────────────────────────────────────────────┘
+│  CLI (clap), config loading, character + platform + renderer   │
+│  wiring, main loop (calloop), scheduler, input-region policy, │
+│  teardown ordering                                            │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 Dependency directions (enforced by Cargo manifests, [Verified] by inspection):
 
-- `ocm-runtime` → `ocm-core`, `ocm-platform`, `ocm-platform-wayland`, `ocm-renderer`.
-- `ocm-platform-wayland` → `ocm-core`, `ocm-platform` (+ `wayland-client`,
-  `wayland-protocols`, `wayland-protocols-wlr`, `calloop`, `raw-window-handle`).
-- `ocm-renderer` → `ocm-core`, `ocm-platform` (+ `wgpu`, `raw-window-handle`,
-  `bytemuck`, `pollster`).
+- `ocm-runtime` → `ocm-core`, `ocm-character`, `ocm-platform`,
+  `ocm-platform-wayland`, `ocm-renderer`.
+- `ocm-character` → `ocm-core`, `ocm-platform` — only the **neutral**
+  types (`Rect`, `PointerEvent`); never a Wayland or GPU type.
+- `ocm-renderer` → `ocm-core`, `ocm-character` (model + pose types),
+  `ocm-platform` (+ `wgpu`, `raw-window-handle`, `bytemuck`, `pollster`).
 - `ocm-renderer` does **not** depend on `wayland-*` crates of any kind.
-- `ocm-platform-wayland` does **not** depend on `wgpu` or any renderer crate.
+- `ocm-platform-wayland` does **not** depend on `wgpu`, any renderer
+  crate or the character crate.
 
 ## 3. Responsibilities
 
 | Crate | Owns | Never touches |
 |---|---|---|
-| `ocm-core` | `Config` (TOML schema), `Layer`, `KeyboardInteractivity`, error enums, `tracing` init | Wayland, wgpu |
+| `ocm-core` | `Config` (TOML schema), `Layer`, `KeyboardInteractivity`, error enums, `tracing` init | Wayland, wgpu, character state |
+| `ocm-character` | Semantic model elements + roles, the character state machine (`Phase`), pointer-interaction interpretation, deterministic physics, the animation seam (`AnimatedPose`), desktop output bounds | Wayland, wgpu, Bevy, renderer types |
 | `ocm-platform` | `PlatformEvent`, `PointerEvent`, `Rect`, `NativeHandles`, `OverlaySurface`/`Platform` traits, `MonitorInfo` | Any concrete windowing stack |
-| `ocm-platform-wayland` | Connection, registry, globals, layer surface, `wl_seat`/`wl_pointer`, `wl_output` + `zxdg_output`, fractional-scale + viewporter, frame callbacks, calloop `EventSource` | wgpu, render math |
-| `ocm-renderer` | wgpu instance/device/queue, surface creation from raw handles, pipelines, cube + shadow scene, camera math, hitbox projection | Wayland client types |
-| `ocm-runtime` | CLI/config merge, platform+renderer construction, `App` state (character, drag, hover), scheduler, input→scene→input-region wiring, teardown | Protocol details |
+| `ocm-platform-wayland` | Connection, registry, globals, layer surface, `wl_seat`/`wl_pointer`, `wl_output` + `zxdg_output`, fractional-scale + viewporter, frame callbacks, calloop `EventSource` | wgpu, render math, character logic |
+| `ocm-renderer` | wgpu instance/device/queue, surface creation from raw handles, pipelines, part-based model drawing, camera + per-element hitbox math | Wayland client types, character behavior |
+| `ocm-runtime` | CLI/config merge, character + platform + renderer construction, scheduler, sleep timer, input-region policy (grab ↔ element rects, deduplicated), teardown | Protocol details |
+
+Character architecture detail (state machine, interaction flow, physics
+constants, animation seam, future glTF/VRM mapping):
+`docs/character-architecture.md`.
 
 ## 4. Platform abstraction without leaking Wayland types
 
