@@ -1,0 +1,11 @@
+[package]
+name = "ocm-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ocm-core.workspace = true
+raw-window-handle.workspace = true

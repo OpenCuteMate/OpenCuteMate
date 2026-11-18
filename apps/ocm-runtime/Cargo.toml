@@ -1,0 +1,20 @@
+[package]
+name = "ocm-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ocm-runtime"
+path = "src/main.rs"
+
+[dependencies]
+ocm-core.workspace = true
+ocm-platform.workspace = true
+ocm-platform-wayland.workspace = true
+ocm-renderer.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
