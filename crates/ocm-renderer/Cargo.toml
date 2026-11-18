@@ -15,6 +15,9 @@ bevy-backend = ["dep:bevy"]
 
 [dependencies]
 ocm-core.workspace = true
+# Model + pose types shared with the character system (the renderers draw
+# whatever CharacterModel they are handed and consume AnimatedPose frames).
+ocm-character.workspace = true
 ocm-platform.workspace = true
 raw-window-handle.workspace = true
 tracing.workspace = true

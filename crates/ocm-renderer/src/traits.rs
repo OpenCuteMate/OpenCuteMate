@@ -6,7 +6,8 @@
 //! is backend-specific (feature-gated concrete types), so it is not part
 //! of the trait.
 
-use crate::{FrameOutcome, Hitbox, RendererError, SceneState};
+use crate::{FrameOutcome, RendererError, SceneState};
+use ocm_character::ElementHitbox;
 
 /// A rendering backend rendering into the platform-owned native surface.
 ///
@@ -22,8 +23,14 @@ pub trait Renderer {
     /// Render one frame from a scene snapshot.
     fn render(&mut self, scene: &SceneState) -> Result<FrameOutcome, RendererError>;
 
-    /// Character hitbox in logical surface pixels for a given scene.
-    /// Must use the same placement math as `render`, so input regions
-    /// always match what is drawn.
-    fn character_hitbox(&self, scene: &SceneState) -> Hitbox;
+    /// Per-element hitboxes in logical surface pixels for a given scene,
+    /// in hit-priority order (children before parents — see
+    /// `ocm_character::model`).
+    ///
+    /// Must use the same placement math as `render`, so the compositor
+    /// input region always matches what is drawn. Hitboxes are
+    /// **pose-independent** by design: the animation pose (bob, squash)
+    /// must never move the input region, or every animated frame would
+    /// commit a compositor state update.
+    fn character_hitboxes(&self, scene: &SceneState) -> Vec<ElementHitbox>;
 }

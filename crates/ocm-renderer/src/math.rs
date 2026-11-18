@@ -31,10 +31,15 @@ pub fn translate(tx: f32, ty: f32, tz: f32) -> Mat4 {
 }
 
 pub fn scale(s: f32) -> Mat4 {
+    scale3(s, s, s)
+}
+
+/// Non-uniform scale (squash & stretch).
+pub fn scale3(sx: f32, sy: f32, sz: f32) -> Mat4 {
     [
-        [s, 0.0, 0.0, 0.0],
-        [0.0, s, 0.0, 0.0],
-        [0.0, 0.0, s, 0.0],
+        [sx, 0.0, 0.0, 0.0],
+        [0.0, sy, 0.0, 0.0],
+        [0.0, 0.0, sz, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
 }
@@ -46,6 +51,30 @@ pub fn rotate_y(angle: f32) -> Mat4 {
         [cos, 0.0, -sin, 0.0],
         [0.0, 1.0, 0.0, 0.0],
         [sin, 0.0, cos, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Rotation around the world X axis (screen-space pitch for the camera
+/// looking down -Z with +X right).
+pub fn rotate_x(angle: f32) -> Mat4 {
+    let (sin, cos) = angle.sin_cos();
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, cos, sin, 0.0],
+        [0.0, -sin, cos, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Rotation around the world Z axis (screen-space roll; positive angles
+/// appear counterclockwise to the viewer).
+pub fn rotate_z(angle: f32) -> Mat4 {
+    let (sin, cos) = angle.sin_cos();
+    [
+        [cos, sin, 0.0, 0.0],
+        [-sin, cos, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
 }
@@ -112,4 +141,48 @@ pub fn normalize(v: Vec3) -> Vec3 {
         return [0.0, 0.0, 0.0];
     }
     [v[0] / len, v[1] / len, v[2] / len]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apply(m: Mat4, v: Vec3) -> Vec3 {
+        let p = [v[0], v[1], v[2], 1.0];
+        let mut out = [0.0f32; 4];
+        for r in 0..4 {
+            let mut sum = 0.0;
+            for k in 0..4 {
+                sum += m[k][r] * p[k];
+            }
+            out[r] = sum;
+        }
+        [out[0], out[1], out[2]]
+    }
+
+    #[test]
+    fn rotate_y_turns_the_front_face_left() {
+        // +Z rotated by +90° around Y lands on +X... for the
+        // right-handed convention here: [sin, 0, cos] columns.
+        let v = apply(rotate_y(std::f32::consts::FRAC_PI_2), [0.0, 0.0, 1.0]);
+        assert!((v[0] - 1.0).abs() < 1e-6, "{v:?}");
+        assert!(v[1].abs() < 1e-6 && v[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotate_x_pitches_the_nose_down() {
+        // +Z rotated by +90° around X lands on -Y (nose-down for our
+        // screen-space pitch).
+        let v = apply(rotate_x(std::f32::consts::FRAC_PI_2), [0.0, 0.0, 1.0]);
+        assert!((v[1] + 1.0).abs() < 1e-6, "{v:?}");
+        assert!(v[0].abs() < 1e-6 && v[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotate_z_is_counterclockwise_to_the_viewer() {
+        // +X rolled by +90° around Z (the view axis) points up (+Y).
+        let v = apply(rotate_z(std::f32::consts::FRAC_PI_2), [1.0, 0.0, 0.0]);
+        assert!((v[1] - 1.0).abs() < 1e-6, "{v:?}");
+        assert!(v[0].abs() < 1e-6 && v[2].abs() < 1e-6);
+    }
 }

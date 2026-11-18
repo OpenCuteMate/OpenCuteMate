@@ -179,6 +179,7 @@ impl Character {
         match *event {
             InteractionEvent::HoverChanged { element } => {
                 self.hover = element;
+                tracing::debug!(?element, "hover state changed");
                 let dirty = true;
                 match (self.phase, element) {
                     // Waking up on any pointer contact.
@@ -436,7 +437,7 @@ impl Character {
     /// Apply new output bounds (e.g. a layer-shell configure): re-clamps
     /// the character into the output; with physics, a character now above
     /// the floor starts falling.
-    pub fn set_bounds(&mut self, bounds: DesktopBounds) -> InteractionOutcome {
+    pub fn set_bounds(&mut self, bounds: DesktopBounds) -> UpdateOutcome {
         self.bounds = bounds;
         let before = self.body.position;
         self.set_anchor_px(self.body.position);
@@ -450,7 +451,7 @@ impl Character {
             self.enter(Phase::Falling);
             needs_frames = true;
         }
-        InteractionOutcome {
+        UpdateOutcome {
             dirty: moved || needs_frames,
             needs_frames,
         }

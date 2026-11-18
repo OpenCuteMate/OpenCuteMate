@@ -22,10 +22,12 @@ use bevy::render::{
 };
 use bevy::transform::TransformPlugin;
 use bevy::window::{Window, WindowResolution};
+use ocm_character::model::CharacterModel;
 use ocm_platform::NativeHandles;
 
 use crate::scene::Camera as SceneCamera;
-use crate::{FrameOutcome, Hitbox, RenderOpts, Renderer, RendererError, SceneState};
+use crate::{FrameOutcome, RenderOpts, Renderer, RendererError, SceneState};
+use ocm_character::ElementHitbox;
 
 use scene::SceneEntities;
 
@@ -101,6 +103,7 @@ fn create_render_resources(
 pub struct BevyRenderer {
     app: App,
     entities: SceneEntities,
+    model: CharacterModel,
     /// Placement/hitbox camera, framed for the current logical size.
     camera: SceneCamera,
     logical: (u32, u32),
@@ -120,6 +123,7 @@ impl BevyRenderer {
         logical: (u32, u32),
         buffer: (u32, u32),
         opts: &RenderOpts,
+        model: &CharacterModel,
     ) -> Result<Self, RendererError> {
         let native = handles::NativeSurface::new(handles);
 
@@ -178,7 +182,7 @@ impl BevyRenderer {
         app.add_plugins(bevy::camera::CameraPlugin);
 
         let window = scene::spawn_window(&mut app, &native, buffer, opts.vsync);
-        let entities = scene::spawn_scene(&mut app, window);
+        let entities = scene::spawn_scene(&mut app, window, model);
 
         // Plugin finish + cleanup: the step a runner would do before the
         // first update (bevy_app's ScheduleRunnerPlugin does the same).
@@ -188,6 +192,7 @@ impl BevyRenderer {
         Ok(Self {
             app,
             entities,
+            model: model.clone(),
             camera: SceneCamera::new(logical),
             logical,
             warmed_up: false,
@@ -308,12 +313,7 @@ impl Renderer for BevyRenderer {
         })
     }
 
-    fn character_hitbox(&self, scene: &SceneState) -> Hitbox {
-        let placement = self.camera.placement(scene);
-        Hitbox {
-            center_x: placement.hitbox_center_px.0,
-            center_y: placement.hitbox_center_px.1,
-            radius: placement.hitbox_radius_px,
-        }
+    fn character_hitboxes(&self, scene: &SceneState) -> Vec<ElementHitbox> {
+        crate::scene::element_hitboxes(scene, &self.model, &self.camera)
     }
 }

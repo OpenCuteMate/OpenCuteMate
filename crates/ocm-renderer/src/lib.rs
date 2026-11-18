@@ -7,15 +7,22 @@
 //!
 //! Two implementations live behind cargo features:
 //!
-//! * `wgpu-backend` (default) — the validated Phase 2 renderer: a
-//!   procedural cube with a soft drop shadow over a fully transparent
-//!   background, wgpu-direct.
+//! * `wgpu-backend` (default) — the validated Phase 2 renderer, now
+//!   drawing arbitrary box-part character models with a soft drop shadow
+//!   over a fully transparent background, wgpu-direct.
 //! * `bevy-backend` (default) — the Phase 2b Bevy 0.20 integration driving
 //!   Bevy's render app against the same native surface (see
 //!   `docs/bevy-integration.md`).
 //!
 //! Both share the placement math in [`math`] / [`scene`], so hitboxes and
 //! on-screen placement are identical between backends.
+//!
+//! Since Phase 3a the backends do not hardcode the cube: they render the
+//! [`ocm_character::CharacterModel`] they were constructed with (one
+//! painter's-order list of box parts) and apply the fully resolved
+//! [`ocm_character::AnimatedPose`] per frame. Hitboxes are per semantic
+//! element, computed from the same camera math — the single source of
+//! truth for what is where on screen.
 
 pub mod math;
 pub mod scene;
@@ -35,6 +42,8 @@ pub use wgpu::WgpuRenderer;
 #[cfg(feature = "bevy-backend")]
 pub use bevy::BevyRenderer;
 
+pub use ocm_character::{AnimatedPose, ElementId};
+
 /// Renderer construction options.
 #[derive(Debug, Clone, Copy)]
 pub struct RenderOpts {
@@ -43,33 +52,28 @@ pub struct RenderOpts {
 }
 
 /// A snapshot of the character state to render.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SceneState {
     /// Normalized position [0,1] x [0,1], top-left origin.
     pub position: (f64, f64),
     /// Character height as a fraction of the logical output height.
     pub size_frac: f32,
-    /// Pointer hover highlight.
-    pub hover: bool,
-    /// Continuous animation (bob + slow spin).
-    pub animate: bool,
-    /// Seconds since start (drives animation).
-    pub time: f32,
+    /// The element under the pointer, for the hover tint (`None` = no
+    /// hover). Pose-driven visuals come from `pose`.
+    pub hover: Option<ElementId>,
+    /// Fully resolved animation state for this frame.
+    pub pose: AnimatedPose,
 }
 
-/// Hitbox of the character in logical surface pixels.
-#[derive(Debug, Clone, Copy)]
-pub struct Hitbox {
-    pub center_x: f32,
-    pub center_y: f32,
-    pub radius: f32,
-}
-
-impl Hitbox {
-    pub fn contains(&self, x: f64, y: f64) -> bool {
-        let dx = x as f32 - self.center_x;
-        let dy = y as f32 - self.center_y;
-        dx * dx + dy * dy <= self.radius * self.radius
+impl SceneState {
+    /// A static scene: neutral pose, nothing hovered.
+    pub fn idle(position: (f64, f64), size_frac: f32) -> Self {
+        Self {
+            position,
+            size_frac,
+            hover: None,
+            pose: AnimatedPose::neutral(0),
+        }
     }
 }
 
@@ -105,19 +109,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hitbox_contains_is_inclusive_at_the_boundary() {
-        let h = Hitbox {
-            center_x: 100.0,
-            center_y: 100.0,
-            radius: 40.0,
-        };
-        assert!(h.contains(100.0, 100.0));
-        assert!(h.contains(140.0, 100.0));
-        assert!(h.contains(
-            100.0 + 40.0 * std::f64::consts::FRAC_1_SQRT_2,
-            100.0 + 40.0 * std::f64::consts::FRAC_1_SQRT_2
-        ));
-        assert!(!h.contains(140.01, 100.0));
-        assert!(!h.contains(0.0, 0.0));
+    fn idle_scene_is_pose_neutral() {
+        let scene = SceneState::idle((0.5, 0.5), 0.4);
+        assert_eq!(scene.hover, None);
+        assert_eq!(scene.pose.root, ocm_character::RootPose::NEUTRAL);
     }
 }

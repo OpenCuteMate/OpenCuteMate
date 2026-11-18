@@ -1,16 +1,23 @@
-//! wgpu-direct rendering backend (the validated Phase 2 renderer).
+//! wgpu-direct rendering backend (the validated Phase 2 renderer,
+//! generalized in Phase 3a to arbitrary box-part character models).
 //!
-//! A procedural cube with a soft drop shadow over a fully transparent
-//! background, driven by [`SceneState`] snapshots. The only `unsafe` is
-//! the documented `create_surface_unsafe` call below — the same call
-//! Bevy's window backend makes internally.
+//! Draws the [`CharacterModel`] as one painter's-order list of box parts
+//! with a soft drop shadow over a fully transparent background, driven by
+//! [`SceneState`] snapshots. The only `unsafe` is the documented
+//! `create_surface_unsafe` call below — the same call Bevy's window
+//! backend makes internally.
+//!
+//! Per-part transforms and tints are uniform slots written each frame;
+//! the base geometry (unit cubes in model space, colored per part) is
+//! static. One bind group per slot, no dynamic-offset complexity.
 
+use ocm_character::model::{CharacterModel, ModelElement, VisualPart};
+use ocm_character::{ElementHitbox, ElementPose};
 use ocm_platform::NativeHandles;
 use wgpu::util::DeviceExt;
 
-use crate::math;
-use crate::scene::Camera;
-use crate::{FrameOutcome, Hitbox, Renderer, RendererError, SceneState};
+use crate::scene::{self, Camera};
+use crate::{FrameOutcome, Renderer, RendererError, SceneState};
 
 /// Negotiated surface configuration (for logging/evidence).
 #[derive(Debug, Clone)]
@@ -22,21 +29,33 @@ pub struct SurfaceInfo {
     pub present_mode: wgpu::PresentMode,
 }
 
-/// Uniform buffer layout, shared with `cube.wgsl` (WGSL uniform layout:
+/// Uniform slot layout, shared with `cube.wgsl` (WGSL uniform layout:
 /// mat4 align 16, vec4 align 16 — matches this repr(C) struct).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
+struct PartUniforms {
     view_proj: [[f32; 4]; 4],
-    cube_model: [[f32; 4]; 4],
-    shadow_model: [[f32; 4]; 4],
-    /// x: premultiplied-output flag, y: shadow strength, z: hover, w: unused
+    model: [[f32; 4]; 4],
+    /// x/y/z: tint multiplier (base color × pose tint × hover), w: unused.
     params: [f32; 4],
 }
 
+/// The shadow slot interprets the same layout differently:
+/// params.x = premultiplied-output flag, params.y = strength.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShadowUniforms {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+    params: [f32; 4],
+}
+
+/// 256-byte alignment keeps every slot usable as a uniform binding.
+const UNIFORM_SLOT_BYTES: u64 = 256;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CubeVertex {
+struct PartVertex {
     position: [f32; 3],
     normal: [f32; 3],
     color: [f32; 3],
@@ -50,6 +69,13 @@ struct ShadowVertex {
     _pad: [f32; 3], // keep stride friendly (24 → 32 bytes)
 }
 
+/// One drawable: an index range inside the shared part buffers, and its
+/// uniform slot.
+struct PartSlot {
+    index_range: std::ops::Range<u32>,
+    slot: u32,
+}
+
 /// The wgpu renderer.
 pub struct WgpuRenderer {
     surface: wgpu::Surface<'static>,
@@ -58,15 +84,18 @@ pub struct WgpuRenderer {
     config: wgpu::SurfaceConfiguration,
     premultiplied: bool,
     uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    cube_pipeline: wgpu::RenderPipeline,
+    /// One bind group per uniform slot (parts + the shadow last).
+    bind_groups: Vec<wgpu::BindGroup>,
+    part_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
-    cube_vb: wgpu::Buffer,
-    cube_ib: wgpu::Buffer,
-    cube_index_count: u32,
+    parts: Vec<PartSlot>,
+    shadow_slot: u32,
+    part_vb: wgpu::Buffer,
+    part_ib: wgpu::Buffer,
     shadow_vb: wgpu::Buffer,
     shadow_ib: wgpu::Buffer,
     shadow_index_count: u32,
+    model: CharacterModel,
     camera: Camera,
     /// Logical surface size the camera is framed for.
     logical: (u32, u32),
@@ -86,6 +115,7 @@ impl WgpuRenderer {
         logical: (u32, u32),
         buffer: (u32, u32),
         opts: &crate::RenderOpts,
+        model: &CharacterModel,
     ) -> Result<Self, RendererError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -233,17 +263,20 @@ impl WgpuRenderer {
         tracing::info!(?format, ?alpha_mode, ?present_mode, "surface configured");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cube shader"),
+            label: Some("character shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("cube.wgsl").into()),
         });
 
-        // Uniform bind group.
+        // Uniform slots: one per drawable part, plus the shadow last.
+        let drawable_parts: Vec<&VisualPart> = drawable_parts(model).collect();
+        let slot_count = drawable_parts.len() as u64 + 1;
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
+            size: slot_count * UNIFORM_SLOT_BYTES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -252,33 +285,44 @@ impl WgpuRenderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Uniforms>() as u64),
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<PartUniforms>() as u64
+                    ),
                 },
                 count: None,
             }],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene bind group"),
-            layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        let bind_groups: Vec<wgpu::BindGroup> = (0..slot_count)
+            .map(|slot| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene bind group"),
+                    layout: &bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &uniform_buffer,
+                            offset: slot * UNIFORM_SLOT_BYTES,
+                            size: wgpu::BufferSize::new(UNIFORM_SLOT_BYTES),
+                        }),
+                    }],
+                })
+            })
+            .collect();
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
 
-        let cube_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cube pipeline"),
+        let part_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("character part pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_cube"),
+                entry_point: Some("vs_part"),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<CubeVertex>() as u64,
+                    array_stride: std::mem::size_of::<PartVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute {
@@ -302,7 +346,7 @@ impl WgpuRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_cube"),
+                entry_point: Some("fs_part"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: None, // single-pass composition; alpha handled in shader
@@ -366,16 +410,17 @@ impl WgpuRenderer {
             cache: None,
         });
 
-        // Geometry: procedural cube (24 verts) + shadow quad.
-        let (cube_vertices, cube_indices) = cube_geometry();
-        let cube_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cube vertex buffer"),
-            contents: bytemuck::cast_slice(&cube_vertices),
+        // Geometry: one unit-cube instance per drawable part (painter's
+        // order = model declaration order), plus the shadow quad.
+        let (part_vertices, part_indices, parts) = part_geometry(model);
+        let part_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("part vertex buffer"),
+            contents: bytemuck::cast_slice(&part_vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let cube_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cube index buffer"),
-            contents: bytemuck::cast_slice(&cube_indices),
+        let part_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("part index buffer"),
+            contents: bytemuck::cast_slice(&part_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
         let shadow_vertices = [
@@ -422,15 +467,17 @@ impl WgpuRenderer {
             config,
             premultiplied,
             uniform_buffer,
-            bind_group,
-            cube_pipeline,
+            bind_groups,
+            part_pipeline,
             shadow_pipeline,
-            cube_vb,
-            cube_ib,
-            cube_index_count: cube_indices.len() as u32,
+            parts,
+            shadow_slot: (slot_count - 1) as u32,
+            part_vb,
+            part_ib,
             shadow_vb,
             shadow_ib,
             shadow_index_count,
+            model: model.clone(),
             camera,
             logical,
             info,
@@ -440,6 +487,29 @@ impl WgpuRenderer {
     /// The negotiated surface configuration (evidence for the test suite).
     pub fn info(&self) -> &SurfaceInfo {
         &self.info
+    }
+
+    /// Effective tint for one part: the element's pose tint multiplied by
+    /// hover brightening. The base color travels in the vertex attribute;
+    /// the shader multiplies both.
+    fn part_tint(
+        &self,
+        scene: &SceneState,
+        element: &ModelElement,
+        element_pose: &ElementPose,
+        _part: &VisualPart,
+    ) -> [f32; 3] {
+        let mut tint = element_pose.tint;
+        if scene.hover == Some(element.id) {
+            // Gentle warm brightening, the wgpu-path successor of the
+            // Phase 2 hover mix.
+            tint = [
+                (tint[0] * 1.22 + 0.02).min(1.0),
+                (tint[1] * 1.16 + 0.015).min(1.0),
+                (tint[2] * 1.06 + 0.01).min(1.0),
+            ];
+        }
+        tint
     }
 }
 
@@ -497,56 +567,47 @@ impl Renderer for WgpuRenderer {
         };
 
         let placement = self.camera.placement(scene);
-        let bob_h = if scene.animate {
-            placement.world_h * 0.055 * (scene.time * 2.2).sin()
-        } else {
-            0.0
-        };
-        let yaw = if scene.animate { scene.time * 0.8 } else { 0.0 };
+        let root = scene::root_model(&placement, &scene.pose.root);
+        let shadow = scene::shadow_model(&placement, &scene.pose.root);
 
-        // Lift the cube by the bob along the camera up axis.
-        let cube_model = math::mat_mul(
-            &math::translate(
-                placement.center[0],
-                placement.center[1] + bob_h * placement.up[1],
-                placement.center[2],
-            ),
-            &math::mat_mul(&math::rotate_y(yaw), &math::scale(placement.world_h)),
-        );
-        let shadow_model = math::billboard(
-            [
-                placement.center[0] - placement.up[0] * placement.world_h * 0.72,
-                placement.center[1] - placement.up[1] * placement.world_h * 0.72 - bob_h * 0.5,
-                placement.center[2] - placement.up[2] * placement.world_h * 0.72,
-            ],
-            [
-                placement.right[0] * placement.world_h * 0.95,
-                placement.right[1] * placement.world_h * 0.95,
-                placement.right[2] * placement.world_h * 0.95,
-            ],
-            [
-                placement.up[0] * placement.world_h * 0.30,
-                placement.up[1] * placement.world_h * 0.30,
-                placement.up[2] * placement.world_h * 0.30,
-            ],
-            placement.forward,
-        );
+        // Write the per-part uniform slots (painter's order = the same
+        // order the parts were baked into the vertex/index buffers).
+        let mut slot = 0u32;
+        for element in self.model.elements() {
+            let element_pose = scene.pose.element(element.id);
+            for part in &element.parts {
+                let model = scene::part_model(&root, element, element_pose, part);
+                let tint = self.part_tint(scene, element, element_pose, part);
+                let uniforms = PartUniforms {
+                    view_proj: placement.view_proj,
+                    model,
+                    params: [tint[0], tint[1], tint[2], 0.0],
+                };
+                self.queue.write_buffer(
+                    &self.uniform_buffer,
+                    slot as u64 * UNIFORM_SLOT_BYTES,
+                    bytemuck::bytes_of(&uniforms),
+                );
+                slot += 1;
+            }
+        }
 
-        let shadow_strength =
-            0.42 * (1.0 - (bob_h / (placement.world_h * 0.06)).abs().clamp(0.0, 1.0) * 0.45);
-        let uniforms = Uniforms {
+        // The shadow slot (last).
+        let shadow_uniforms = ShadowUniforms {
             view_proj: placement.view_proj,
-            cube_model,
-            shadow_model,
+            model: shadow,
             params: [
                 if self.premultiplied { 1.0 } else { 0.0 },
-                shadow_strength,
-                if scene.hover { 1.0 } else { 0.0 },
+                scene::shadow_strength(&scene.pose.root),
+                0.0,
                 0.0,
             ],
         };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            self.shadow_slot as u64 * UNIFORM_SLOT_BYTES,
+            bytemuck::bytes_of(&shadow_uniforms),
+        );
 
         let view = frame
             .texture
@@ -583,18 +644,21 @@ impl Renderer for WgpuRenderer {
                 multiview_mask: None,
             });
 
-            // Painter's order: shadow first, cube over it. No blending —
+            // Painter's order: shadow first, parts over it. No blending —
             // each fragment computes its final alpha-mode-correct color.
-            pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.shadow_pipeline);
+            pass.set_bind_group(0, &self.bind_groups[self.shadow_slot as usize], &[]);
             pass.set_vertex_buffer(0, self.shadow_vb.slice(..));
             pass.set_index_buffer(self.shadow_ib.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..self.shadow_index_count, 0, 0..1);
 
-            pass.set_pipeline(&self.cube_pipeline);
-            pass.set_vertex_buffer(0, self.cube_vb.slice(..));
-            pass.set_index_buffer(self.cube_ib.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.cube_index_count, 0, 0..1);
+            pass.set_pipeline(&self.part_pipeline);
+            pass.set_vertex_buffer(0, self.part_vb.slice(..));
+            pass.set_index_buffer(self.part_ib.slice(..), wgpu::IndexFormat::Uint16);
+            for part in &self.parts {
+                pass.set_bind_group(0, &self.bind_groups[part.slot as usize], &[]);
+                pass.draw_indexed(part.index_range.clone(), 0, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -610,13 +674,8 @@ impl Renderer for WgpuRenderer {
         })
     }
 
-    fn character_hitbox(&self, scene: &SceneState) -> Hitbox {
-        let placement = self.camera.placement(scene);
-        Hitbox {
-            center_x: placement.hitbox_center_px.0,
-            center_y: placement.hitbox_center_px.1,
-            radius: placement.hitbox_radius_px,
-        }
+    fn character_hitboxes(&self, scene: &SceneState) -> Vec<ElementHitbox> {
+        scene::element_hitboxes(scene, &self.model, &self.camera)
     }
 }
 
@@ -638,99 +697,116 @@ fn format_has_alpha(format: wgpu::TextureFormat) -> bool {
     )
 }
 
-/// Procedural cube: 24 vertices (4 per face, wound CCW for back-face
-/// culling), per-face colors and normals.
-fn cube_geometry() -> (Vec<CubeVertex>, Vec<u16>) {
-    let s = 0.5; // half-size; the model scale adjusts the world size
+/// All drawable visual parts in painter's order (model declaration order).
+fn drawable_parts(model: &CharacterModel) -> impl Iterator<Item = &VisualPart> {
+    model.elements().iter().flat_map(|e| e.parts.iter())
+}
 
-    let front = (0.0, 0.0, 1.0);
-    let back = (0.0, 0.0, -1.0);
-    let top = (0.0, 1.0, 0.0);
-    let bottom = (0.0, -1.0, 0.0);
-    let right = (1.0, 0.0, 0.0);
-    let left = (-1.0, 0.0, 0.0);
+/// One unit cube per drawable part, colored with the part's base color;
+/// the per-frame model matrix does the placement/scaling. Returns the
+/// vertex/index buffers and the per-part index ranges + slot indices.
+fn part_geometry(model: &CharacterModel) -> (Vec<PartVertex>, Vec<u16>, Vec<PartSlot>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut parts = Vec::new();
+    let mut slot = 0u32;
+    for element in model.elements() {
+        for part in &element.parts {
+            let base = vertices.len() as u16;
+            for v in unit_cube(part.color) {
+                vertices.push(v);
+            }
+            for i in CUBE_INDICES {
+                indices.push(base + i);
+            }
+            parts.push(PartSlot {
+                index_range: (indices.len() - CUBE_INDICES.len()) as u32..(indices.len() as u32),
+                slot,
+            });
+            slot += 1;
+        }
+    }
+    (vertices, indices, parts)
+}
 
-    let c_front = [0.94, 0.38, 0.28]; // coral
-    let c_back = [0.22, 0.62, 0.62]; // teal
-    let c_top = [0.98, 0.80, 0.30]; // warm yellow
-    let c_bottom = [0.45, 0.32, 0.68]; // purple
-    let c_right = [0.95, 0.60, 0.24]; // orange
-    let c_left = [0.36, 0.70, 0.90]; // sky blue
+const CUBE_INDICES: [u16; 36] = [
+    0, 1, 2, 0, 2, 3, // front
+    4, 5, 6, 4, 6, 7, // back
+    8, 9, 10, 8, 10, 11, // top
+    12, 13, 14, 12, 14, 15, // bottom
+    16, 17, 18, 16, 18, 19, // right
+    20, 21, 22, 20, 22, 23, // left
+];
 
-    let v = |p: [f32; 3], n: (f32, f32, f32), c: [f32; 3]| CubeVertex {
+/// Unit cube spanning [-0.5, 0.5]³: 24 vertices (4 per face, wound CCW for
+/// back-face culling) with per-face normals and one shared color.
+fn unit_cube(color: [f32; 3]) -> Vec<PartVertex> {
+    let s = 0.5;
+    let v = |p: [f32; 3], n: [f32; 3]| PartVertex {
         position: p,
-        normal: [n.0, n.1, n.2],
-        color: c,
+        normal: n,
+        color,
     };
+    let front = [0.0, 0.0, 1.0];
+    let back = [0.0, 0.0, -1.0];
+    let top = [0.0, 1.0, 0.0];
+    let bottom = [0.0, -1.0, 0.0];
+    let right = [1.0, 0.0, 0.0];
+    let left = [-1.0, 0.0, 0.0];
 
-    let vertices: Vec<CubeVertex> = vec![
+    vec![
         // front (z = +s)
-        v([-s, -s, s], front, c_front),
-        v([s, -s, s], front, c_front),
-        v([s, s, s], front, c_front),
-        v([-s, s, s], front, c_front),
+        v([-s, -s, s], front),
+        v([s, -s, s], front),
+        v([s, s, s], front),
+        v([-s, s, s], front),
         // back (z = -s)
-        v([-s, -s, -s], back, c_back),
-        v([-s, s, -s], back, c_back),
-        v([s, s, -s], back, c_back),
-        v([s, -s, -s], back, c_back),
+        v([-s, -s, -s], back),
+        v([-s, s, -s], back),
+        v([s, s, -s], back),
+        v([s, -s, -s], back),
         // top (y = +s)
-        v([-s, s, -s], top, c_top),
-        v([-s, s, s], top, c_top),
-        v([s, s, s], top, c_top),
-        v([s, s, -s], top, c_top),
+        v([-s, s, -s], top),
+        v([-s, s, s], top),
+        v([s, s, s], top),
+        v([s, s, -s], top),
         // bottom (y = -s)
-        v([-s, -s, -s], bottom, c_bottom),
-        v([s, -s, -s], bottom, c_bottom),
-        v([s, -s, s], bottom, c_bottom),
-        v([-s, -s, s], bottom, c_bottom),
+        v([-s, -s, -s], bottom),
+        v([s, -s, -s], bottom),
+        v([s, -s, s], bottom),
+        v([-s, -s, s], bottom),
         // right (x = +s)
-        v([s, -s, -s], right, c_right),
-        v([s, s, -s], right, c_right),
-        v([s, s, s], right, c_right),
-        v([s, -s, s], right, c_right),
+        v([s, -s, -s], right),
+        v([s, s, -s], right),
+        v([s, s, s], right),
+        v([s, -s, s], right),
         // left (x = -s)
-        v([-s, -s, s], left, c_left),
-        v([-s, s, s], left, c_left),
-        v([-s, s, -s], left, c_left),
-        v([-s, -s, -s], left, c_left),
-    ];
-
-    let indices: Vec<u16> = vec![
-        0, 1, 2, 0, 2, 3, // front
-        4, 5, 6, 4, 6, 7, // back
-        8, 9, 10, 8, 10, 11, // top
-        12, 13, 14, 12, 14, 15, // bottom
-        16, 17, 18, 16, 18, 19, // right
-        20, 21, 22, 20, 22, 23, // left
-    ];
-
-    (vertices, indices)
+        v([-s, -s, s], left),
+        v([-s, s, s], left),
+        v([-s, s, -s], left),
+        v([-s, -s, -s], left),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ocm_character::prototype_cube;
 
     #[test]
-    fn cube_geometry_is_wellformed() {
-        let (vertices, indices) = cube_geometry();
-        assert_eq!(vertices.len(), 24); // 4 per face, 6 faces
-        assert_eq!(indices.len(), 36); // 2 triangles per face
-        assert!(indices.iter().all(|&i| (i as usize) < vertices.len()));
-        // All six face colors are present exactly four times.
-        let face_colors = [
-            [0.94, 0.38, 0.28],
-            [0.22, 0.62, 0.62],
-            [0.98, 0.80, 0.30],
-            [0.45, 0.32, 0.68],
-            [0.95, 0.60, 0.24],
-            [0.36, 0.70, 0.90],
-        ];
-        for color in face_colors {
-            let count = vertices.iter().filter(|v| v.color == color).count();
-            assert_eq!(count, 4);
+    fn part_geometry_has_one_cube_per_drawable_part() {
+        let model = prototype_cube();
+        let drawable = drawable_parts(&model).count();
+        let (vertices, indices, parts) = part_geometry(&model);
+        assert_eq!(drawable, 7); // body + 2 arms + face plate + mouth + 2 eyes
+        assert_eq!(vertices.len(), drawable * 24);
+        assert_eq!(indices.len(), drawable * 36);
+        assert_eq!(parts.len(), drawable);
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(part.slot as usize, index);
+            assert_eq!(part.index_range.len() as u32, 36);
         }
+        assert!(indices.iter().all(|&i| (i as usize) < vertices.len()));
     }
 
     #[test]

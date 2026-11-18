@@ -1,19 +1,31 @@
 //! # ocm-runtime
 //!
-//! OpenCuteMate PoC runtime: CLI + TOML config, platform init, renderer
-//! init, the calloop main loop, the state-based render scheduler and the
+//! OpenCuteMate runtime: CLI + TOML config, platform init, renderer init,
+//! the calloop main loop, the state-based render scheduler and the
 //! explicit teardown ordering.
+//!
+//! Phase 3a wiring: platform events are translated by
+//! [`ocm_character::InteractionSystem`] into semantic interaction events,
+//! consumed by the [`ocm_character::Character`] aggregate; renderers draw
+//! the character's model and pose. The input region follows a pointer-grab
+//! policy: element rects while idle (click-through preserved), the whole
+//! surface while dragging (a drag can never outrun the character), with
+//! commits deduplicated.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use clap::{ArgAction, Parser};
+use ocm_character::{Character, DesktopBounds, ElementHitbox, InteractionEvent, InteractionSystem};
 use ocm_core::logging;
 use ocm_core::{Config, Layer, PlatformError};
-use ocm_platform::{OverlaySurface, Platform, PlatformEvent, PointerEventKind, Rect};
+use ocm_platform::{OverlaySurface, Platform, PlatformEvent, Rect};
 use ocm_platform_wayland::WaylandPlatform;
-use ocm_renderer::{FrameOutcome, Hitbox, RenderOpts, Renderer, SceneState};
+use ocm_renderer::{FrameOutcome, RenderOpts, Renderer, SceneState};
+
+/// Seconds of inactivity before the character falls asleep.
+const SLEEP_AFTER: Duration = Duration::from_secs(60);
 
 /// Frame pacing / scheduler state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,75 +34,99 @@ enum RenderMode {
     Idle,
     /// Interaction-driven: render when dirty, follow with one frame callback.
     EventDriven,
-    /// Continuous animation, driven by frame callbacks + FPS cap.
+    /// Continuous updates while the character needs frames (physics in
+    /// flight, one-shot reactions, or the legacy `animate` mode), driven
+    /// by frame callbacks + FPS cap.
     Animated,
+}
+
+/// What the compositor input region currently says.
+#[derive(Debug, Clone, PartialEq)]
+enum InputRegion {
+    /// Not applied yet.
+    Unset,
+    /// Click-through: only the character's element rects.
+    Rects(Vec<Rect>),
+    /// Pointer grab: the whole surface is interactive (dragging).
+    FullSurface,
 }
 
 struct App {
     overlay: ocm_platform_wayland::WaylandOverlay,
     renderer: Box<dyn Renderer>,
     config: Config,
-    /// Character state (normalized position etc.).
-    character: CharacterState,
-    /// Whether the pointer is currently over the character hitbox.
-    hover: bool,
-    drag: Option<DragState>,
+    /// Character system: phase machine, physics, pose.
+    character: Character,
+    /// Mechanical pointer interpretation (hover/press/drag).
+    interaction: InteractionSystem,
+    /// Bounds of the output the character lives on (logical px).
+    bounds: DesktopBounds,
     mode: RenderMode,
     dirty: bool,
     last_present: Instant,
+    last_update: Instant,
     frame_interval: Duration,
     timer: Option<RegistrationToken>,
+    sleep_timer: Option<RegistrationToken>,
+    /// The input region last committed to the compositor (dedup).
+    input_region: InputRegion,
     quit: bool,
     frames: u64,
     idle_logged: bool,
     loop_handle: LoopHandle<'static, App>,
 }
 
-struct CharacterState {
-    position: (f64, f64),
-    size_frac: f32,
-    animate: bool,
-    start: Instant,
-}
-
-struct DragState {
-    /// Pointer offset (logical px) from the character center at grab time.
-    grab_offset: (f64, f64),
-}
-
 impl App {
     fn scene(&self) -> SceneState {
         SceneState {
-            position: self.character.position,
-            size_frac: self.character.size_frac,
-            hover: self.hover,
-            animate: self.character.animate,
-            time: self.character.start.elapsed().as_secs_f32(),
+            position: self.character.position(),
+            size_frac: self.character.size_frac(),
+            hover: self.character.hovered_element(),
+            pose: self.character.pose(),
         }
     }
 
-    fn hitbox(&self) -> Hitbox {
-        self.renderer.character_hitbox(&self.scene())
+    fn hitboxes(&self) -> Vec<ElementHitbox> {
+        self.renderer.character_hitboxes(&self.scene())
     }
 
-    /// Apply the input region according to click-through config and the
-    /// current character placement. Commits immediately (see
-    /// docs/architecture.md §11).
-    fn apply_input_region(&mut self) {
+    /// The compositor input region for the current state: element rects
+    /// while resting (click-through outside the character), the whole
+    /// surface while dragging (the logical pointer grab).
+    fn desired_region(&mut self) -> Option<Vec<Rect>> {
         if !self.config.window.click_through {
-            // Click-through disabled: the whole surface is interactive.
-            self.overlay.set_input_region(None);
+            return None; // whole surface interactive, always
+        }
+        if self.character.is_dragging() {
+            return None; // pointer grab: never let a fast drag escape
+        }
+        Some(
+            self.hitboxes()
+                .into_iter()
+                .map(|hitbox| hitbox.rect)
+                .collect(),
+        )
+    }
+
+    /// Commit the input region if it changed. Commits are compositor
+    /// round-trips — unnecessary ones are avoided by the dedup state.
+    fn apply_input_region(&mut self) {
+        let region = match self.desired_region() {
+            None => InputRegion::FullSurface,
+            Some(rects) => InputRegion::Rects(rects),
+        };
+        if self.input_region == region {
             return;
         }
-        let hitbox = self.hitbox();
-        let rect = Rect {
-            x: (hitbox.center_x - hitbox.radius).floor() as i32,
-            y: (hitbox.center_y - hitbox.radius).floor() as i32,
-            width: (hitbox.radius * 2.0).ceil() as i32,
-            height: (hitbox.radius * 2.0).ceil() as i32,
-        };
-        tracing::debug!(?rect, "setting input region");
-        self.overlay.set_input_region(Some(&[rect]));
+        match &region {
+            InputRegion::FullSurface => self.overlay.set_input_region(None),
+            InputRegion::Rects(rects) => {
+                tracing::debug!(count = rects.len(), "setting input region");
+                self.overlay.set_input_region(Some(rects));
+            }
+            InputRegion::Unset => unreachable!(),
+        }
+        self.input_region = region;
     }
 
     /// Render now if the FPS cap allows, otherwise defer with a timer.
@@ -103,8 +139,23 @@ impl App {
         }
     }
 
-    /// Encode + present one frame, then arm a frame callback.
+    /// Advance the character by the wall time since the last advance,
+    /// then encode + present one frame and arm a frame callback.
     fn render_now(&mut self) {
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f32();
+        self.last_update = now;
+        let outcome = self.character.update(dt);
+        if outcome.dirty {
+            // Position may have moved (fall/slide): the input region must
+            // keep covering the character. Deduplicated, so reaction-only
+            // frames with an unchanged position commit nothing.
+            self.apply_input_region();
+        }
+        self.apply_mode(outcome);
+
         let scene = self.scene();
         // Request the frame callback BEFORE presenting: a wl_surface.frame
         // request latches onto the next commit, and the present in
@@ -147,6 +198,23 @@ impl App {
         }
     }
 
+    /// Fold a character outcome into the scheduler mode and the sleep
+    /// timer.
+    fn apply_mode(&mut self, outcome: ocm_character::UpdateOutcome) {
+        if outcome.needs_frames {
+            if self.mode != RenderMode::Animated {
+                tracing::debug!("scheduler: continuous frames (character active)");
+            }
+            self.mode = RenderMode::Animated;
+            self.cancel_sleep_timer();
+        } else if self.mode == RenderMode::Animated {
+            // Continuous work finished: fall back to event-driven.
+            self.mode = RenderMode::EventDriven;
+            self.dirty = true; // one final settled frame
+            tracing::debug!("scheduler: character settled");
+        }
+    }
+
     /// One-shot timer for FPS-cap deferral / retry.
     ///
     /// Deduplicated: while one timer is pending, later requests piggyback on
@@ -177,12 +245,57 @@ impl App {
         }
     }
 
+    /// Arm the one-shot sleep timer (idling towards Sleeping).
+    fn arm_sleep_timer(&mut self) {
+        if self.sleep_timer.is_some() || self.mode != RenderMode::Idle {
+            return;
+        }
+        match self.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(SLEEP_AFTER),
+            |_, _, app| {
+                app.on_sleep_timeout();
+                calloop::timer::TimeoutAction::Drop
+            },
+        ) {
+            Ok(token) => self.sleep_timer = Some(token),
+            Err(e) => tracing::error!("failed to schedule sleep timer: {e}"),
+        }
+    }
+
+    fn cancel_sleep_timer(&mut self) {
+        if let Some(token) = self.sleep_timer.take() {
+            self.loop_handle.remove(token);
+        }
+    }
+
+    fn on_sleep_timeout(&mut self) {
+        self.sleep_timer = None;
+        if self.character.try_sleep() {
+            if self.mode == RenderMode::Idle {
+                self.mode = RenderMode::EventDriven;
+            }
+            self.dirty = true;
+            self.maybe_render();
+        }
+    }
+
     /// Decide the next step after a frame callback fired.
     fn on_frame(&mut self) {
         match self.mode {
             RenderMode::Animated => {
-                self.dirty = true; // animation advances every frame
-                self.maybe_render();
+                if self.character.wants_frames() {
+                    // Continuous character work in flight: the next
+                    // render_now advances the character exactly once.
+                    self.dirty = true;
+                    self.maybe_render();
+                } else {
+                    // The character settled: one final settled frame, then
+                    // fall back to event-driven parking.
+                    self.mode = RenderMode::EventDriven;
+                    self.dirty = true;
+                    tracing::debug!("scheduler: character settled");
+                    self.maybe_render();
+                }
             }
             RenderMode::EventDriven => {
                 if self.dirty {
@@ -192,6 +305,7 @@ impl App {
                     // and no timers are scheduled — the thread blocks in
                     // dispatch(None) until the next platform event.
                     self.mode = RenderMode::Idle;
+                    self.arm_sleep_timer();
                     if !self.idle_logged {
                         tracing::info!(frames = self.frames, "rendering parked (idle)");
                         self.idle_logged = true;
@@ -212,8 +326,11 @@ impl App {
             PlatformEvent::Configure { width, height } => {
                 let buffer = self.overlay.buffer_size();
                 self.renderer.resize((width, height), buffer);
+                self.bounds = DesktopBounds::new(width, height);
+                let outcome = self.character.set_bounds(self.bounds);
                 self.dirty = true;
                 self.apply_input_region();
+                self.apply_mode(outcome);
                 self.maybe_render();
             }
             PlatformEvent::ScaleChanged { scale: _ } => {
@@ -234,74 +351,57 @@ impl App {
     }
 
     fn on_pointer(&mut self, pointer: ocm_platform::PointerEvent) {
-        match pointer.kind {
-            PointerEventKind::Enter | PointerEventKind::Motion => {
-                let hitbox = self.hitbox();
-                let over = hitbox.contains(pointer.x, pointer.y);
-                if over != self.hover {
-                    self.hover = over;
-                    self.dirty = true;
-                    tracing::debug!(hover = over, "hover state changed");
-                }
-                if let Some(drag) = &self.drag {
-                    // Dragging: move the character so that the grab offset
-                    // stays under the pointer.
-                    let (w, h) = self.overlay.logical_size();
-                    let cx = (pointer.x - drag.grab_offset.0).clamp(0.0, w as f64);
-                    let cy = (pointer.y - drag.grab_offset.1).clamp(0.0, h as f64);
-                    self.character.position = (cx / w.max(1) as f64, cy / h.max(1) as f64);
-                    self.dirty = true;
-                    self.apply_input_region();
-                }
-                self.maybe_render();
+        // Only pointer events can wake a sleeping or idle character: the
+        // sleep timer is cancelled until the next park.
+        self.cancel_sleep_timer();
+        let now = Instant::now();
+        // Reaction clocks start at this event, not at the last rendered
+        // frame (which may have been a parked-state render long ago).
+        self.last_update = now;
+        let hitboxes = self.hitboxes();
+        let events = self.interaction.on_pointer(now, &pointer, &hitboxes);
+
+        let mut needs_frames = false;
+        for event in &events {
+            // The runtime-level exit affordance (unchanged since Phase 2).
+            if let InteractionEvent::Press {
+                element,
+                button: ocm_platform::PointerButton::Right,
+            } = event
+            {
+                let model = self.character.model();
+                tracing::info!(
+                    element = %model.element(*element).name,
+                    "right click on character; quitting"
+                );
+                self.quit = true;
+                return;
             }
-            PointerEventKind::Leave => {
-                if self.hover {
-                    self.hover = false;
-                    self.dirty = true;
-                }
-                self.maybe_render();
-            }
-            PointerEventKind::Press { button } => {
-                let hitbox = self.hitbox();
-                match button {
-                    ocm_platform::PointerButton::Left => {
-                        if hitbox.contains(pointer.x, pointer.y) {
-                            let (w, h) = self.overlay.logical_size();
-                            self.drag = Some(DragState {
-                                grab_offset: (
-                                    pointer.x - self.character.position.0 * w as f64,
-                                    pointer.y - self.character.position.1 * h as f64,
-                                ),
-                            });
-                            tracing::info!(x = pointer.x, y = pointer.y, "drag started");
-                        }
-                    }
-                    ocm_platform::PointerButton::Right => {
-                        if hitbox.contains(pointer.x, pointer.y) {
-                            tracing::info!("right click on character; quitting");
-                            self.quit = true;
-                        } else {
-                            tracing::debug!("right click outside hitbox (passed through)");
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            PointerEventKind::Release { button } => {
-                if matches!(button, ocm_platform::PointerButton::Left) && self.drag.is_some() {
-                    self.drag = None;
-                    tracing::info!(?self.character.position, "drag ended");
-                }
-            }
+
+            let outcome = self.character.handle_interaction(now, event);
+            self.dirty |= outcome.dirty;
+            needs_frames |= outcome.needs_frames;
         }
+        if self.dirty {
+            // Position may have changed (drag move): the region follows
+            // whenever the pointer grabbed or released.
+            self.apply_input_region();
+        }
+        if needs_frames {
+            // A reaction/physics just started while parked.
+            if self.mode == RenderMode::Idle {
+                self.mode = RenderMode::EventDriven;
+            }
+            self.dirty = true;
+        }
+        self.maybe_render();
     }
 }
 
 #[derive(Parser, Debug)]
 #[command(
     name = "ocm-runtime",
-    about = "OpenCuteMate desktop companion runtime (PoC: procedural cube)",
+    about = "OpenCuteMate desktop companion runtime (prototype cube character)",
     version
 )]
 struct Args {
@@ -344,6 +444,16 @@ struct Args {
     /// Disable continuous animation (default).
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "animate")]
     no_animate: bool,
+
+    /// Enable character physics: the character falls to the floor on
+    /// spawn and after drag releases (toss with the release velocity).
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_physics")]
+    physics: bool,
+
+    /// Disable character physics (default): the character rests where it
+    /// is placed or dropped.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "physics")]
+    no_physics: bool,
 
     /// Disable vsync (use best-effort no-vsync present mode).
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "vsync")]
@@ -425,6 +535,12 @@ fn main() -> ExitCode {
     if args.no_animate {
         config.character.animate = false;
     }
+    if args.physics {
+        config.character.physics = true;
+    }
+    if args.no_physics {
+        config.character.physics = false;
+    }
     if args.no_vsync {
         config.render.vsync = false;
     }
@@ -432,7 +548,7 @@ fn main() -> ExitCode {
         config.render.vsync = true;
     }
 
-    tracing::info!(?config, "starting OpenCuteMate PoC");
+    tracing::info!(?config, "starting OpenCuteMate runtime");
 
     // ---- Platform ------------------------------------------------------------
     let mut platform = match WaylandPlatform::connect() {
@@ -462,6 +578,15 @@ fn main() -> ExitCode {
         }
     };
 
+    // ---- Character ------------------------------------------------------------
+    let bounds = DesktopBounds::new(overlay.logical_size().0, overlay.logical_size().1);
+    let character = Character::new(&config.character, ocm_character::prototype_cube(), bounds);
+    tracing::info!(
+        phase = character.phase().name(),
+        physics = config.character.physics,
+        "character initialized"
+    );
+
     // ---- Renderer -------------------------------------------------------------
     let render_opts = RenderOpts {
         vsync: config.render.vsync,
@@ -477,6 +602,7 @@ fn main() -> ExitCode {
                         overlay.logical_size(),
                         overlay.buffer_size(),
                         &render_opts,
+                        character.model(),
                     ) {
                         Ok(r) => r,
                         Err(e) => {
@@ -507,6 +633,7 @@ fn main() -> ExitCode {
                         overlay.logical_size(),
                         overlay.buffer_size(),
                         &render_opts,
+                        character.model(),
                     ) {
                         Ok(r) => r,
                         Err(e) => {
@@ -562,17 +689,9 @@ fn main() -> ExitCode {
         overlay: overlay.clone(),
         renderer,
         config: config.clone(),
-        character: CharacterState {
-            position: (
-                config.character.position_x.clamp(0.0, 1.0) as f64,
-                config.character.position_y.clamp(0.0, 1.0) as f64,
-            ),
-            size_frac: config.character.size,
-            animate: config.character.animate,
-            start: Instant::now(),
-        },
-        hover: false,
-        drag: None,
+        character,
+        interaction: InteractionSystem::new(),
+        bounds,
         mode: if config.character.animate {
             RenderMode::Animated
         } else {
@@ -582,8 +701,11 @@ fn main() -> ExitCode {
         last_present: Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now),
+        last_update: Instant::now(),
         frame_interval,
         timer: None,
+        sleep_timer: None,
+        input_region: InputRegion::Unset,
         quit: false,
         frames: 0,
         idle_logged: false,
@@ -628,7 +750,7 @@ fn main() -> ExitCode {
     }
 
     // ---- Teardown: documented destruction order -----------------------------
-    // 1. Drop the app (and with it the wgpu renderer: the Surface releases
+    // 1. Drop the app (and with it the renderer: the GPU surface releases
     //    its Vulkan swapchain *before* any Wayland object dies).
     tracing::info!("teardown: dropping renderer (wgpu surface) first");
     drop(app);

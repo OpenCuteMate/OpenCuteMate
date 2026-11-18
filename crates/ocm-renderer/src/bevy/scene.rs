@@ -1,26 +1,51 @@
-//! The PoC scene as Bevy entities, synchronized from [`SceneState`].
+//! The character model as Bevy entities, synchronized from
+//! [`SceneState`].
 //!
 //! Placement uses the exact same math as the wgpu backend
-//! (`crate::math` + `crate::scene::Camera::placement`), so the character
-//! renders at the same world position — and therefore the same logical
-//! pixel position and hitbox — under both backends.
+//! (`crate::math` + `crate::scene`), so the character renders at the same
+//! world position — and therefore the same logical pixel position and
+//! hitbox — under both backends.
+//!
+//! Entity shape mirrors the model's element hierarchy: a root entity
+//! (per-frame composed root pose) with one child entity per element and
+//! one grandchild per visual part. Element poses (sleep-flattened eyes)
+//! scale the element entities; hover tints the part materials. A future
+//! skeleton path maps bones onto the same hierarchy.
 
 use bevy::app::App;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use crate::math::{self, Mat4};
+use crate::math::Mat4;
 use crate::scene::Camera as SceneCamera;
 use crate::SceneState;
 
 use super::handles::NativeSurface;
 
-/// Entity/material ids of the spawned scene, kept by the renderer.
+/// Entity/material handles of the spawned scene, kept by the renderer.
 pub(crate) struct SceneEntities {
     pub(crate) window: Entity,
-    pub(crate) character: Entity,
+    pub(crate) root: Entity,
     pub(crate) shadow: Entity,
-    pub(crate) character_material: Handle<StandardMaterial>,
+    /// (element entity, element id) pairs.
+    pub(crate) elements: Vec<(Entity, ocm_character::ElementId)>,
+    /// (part entity, its material, its element id, base sRGB color).
+    pub(crate) parts: Vec<(
+        Entity,
+        Handle<StandardMaterial>,
+        ocm_character::ElementId,
+        [f32; 3],
+    )>,
+    /// The shadow material (strength follows the bob each frame).
+    pub(crate) shadow_material: Handle<StandardMaterial>,
+}
+
+/// A part to spawn: local placement plus its material and base color.
+struct PartSpec {
+    offset: [f32; 3],
+    size: [f32; 3],
+    material: Handle<StandardMaterial>,
+    base_color: [f32; 3],
 }
 
 /// The window entity carrying our native handles; `bevy_render`'s
@@ -52,9 +77,14 @@ pub(crate) fn spawn_window(
         .id()
 }
 
-/// Camera + character + shadow, framed by the shared scene constants.
-/// `window` is the entity from `spawn_window` (kept for resize).
-pub(crate) fn spawn_scene(app: &mut App, window: Entity) -> SceneEntities {
+/// Camera + character part hierarchy + shadow, framed by the shared scene
+/// constants. `window` is the entity from `spawn_window` (kept for
+/// resize).
+pub(crate) fn spawn_scene(
+    app: &mut App,
+    window: Entity,
+    model: &ocm_character::CharacterModel,
+) -> SceneEntities {
     let world = app.world_mut();
 
     // Camera: the constants from crate::scene (EYE/TARGET/FOV_Y/NEAR/FAR),
@@ -85,20 +115,83 @@ pub(crate) fn spawn_scene(app: &mut App, window: Entity) -> SceneEntities {
             .looking_at(crate::scene::TARGET.into(), Vec3::Y),
     ));
 
-    // Meshes: unit cuboid spanning [-0.5, 0.5]³ (like the wgpu geometry)
-    // and a [-1, 1]² billboard quad for the shadow.
+    // Meshes: one unit cuboid per visual part (the per-frame transform
+    // does the placement/scale) and a [-1, 1]² billboard quad for the
+    // shadow.
     let mut meshes = world.resource_mut::<Assets<Mesh>>();
-    let character_mesh = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
+    let part_mesh = meshes.add(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)));
     let shadow_mesh = meshes.add(Mesh::from(Cuboid::new(2.0, 2.0, 0.02)));
 
-    let (character_material, shadow_material) = {
+    // Root entity: the composed root transform is written per frame.
+    let root = world.spawn(Transform::IDENTITY).id();
+
+    // Create every part material first (assets borrow the world), then
+    // spawn the hierarchy.
+    let mut elements = Vec::new();
+    let mut parts = Vec::new();
+    let spec_data: Vec<(ocm_character::ElementId, [f32; 3], Vec<PartSpec>)> = {
         let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
-        let character = materials.add(StandardMaterial {
-            base_color: normal_color(), // coral, matching the wgpu cube's front face
-            unlit: true,
-            ..default()
-        });
-        let shadow = materials.add(StandardMaterial {
+        model
+            .elements()
+            .iter()
+            .map(|element| {
+                let parts: Vec<PartSpec> = element
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        let base_color = [
+                            part.color[0].clamp(0.0, 1.0),
+                            part.color[1].clamp(0.0, 1.0),
+                            part.color[2].clamp(0.0, 1.0),
+                        ];
+                        let material = materials.add(StandardMaterial {
+                            base_color: Color::srgb(base_color[0], base_color[1], base_color[2]),
+                            unlit: true,
+                            ..default()
+                        });
+                        PartSpec {
+                            offset: part.offset,
+                            size: part.size,
+                            material,
+                            base_color,
+                        }
+                    })
+                    .collect();
+                (element.id, element.offset, parts)
+            })
+            .collect()
+    };
+    for (element_id, element_offset, part_specs) in spec_data {
+        let element_entity = world
+            .spawn((
+                Transform::from_translation(element_offset.into()),
+                ChildOf(root),
+            ))
+            .id();
+        elements.push((element_entity, element_id));
+        for spec in part_specs {
+            let part_entity = world
+                .spawn((
+                    Mesh3d(part_mesh.clone()),
+                    MeshMaterial3d(spec.material.clone()),
+                    Transform::from_translation(spec.offset.into()).with_scale(Vec3::new(
+                        spec.size[0],
+                        spec.size[1],
+                        spec.size[2],
+                    )),
+                    ChildOf(element_entity),
+                ))
+                .id();
+            parts.push((part_entity, spec.material, element_id, spec.base_color));
+        }
+    }
+
+    // Soft radial shadow: a procedural alpha texture reproducing the wgpu
+    // shader's falloff (cube.wgsl fs_shadow), so the Bevy shadow band has
+    // the same partial-alpha footprint as the reference renderer.
+    let shadow_material = world
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
             base_color: Color::WHITE,
             // Straight alpha; blending over the (0,0,0,0) clear leaves
             // premultiplied-correct values in the buffer for the compositor.
@@ -106,11 +199,6 @@ pub(crate) fn spawn_scene(app: &mut App, window: Entity) -> SceneEntities {
             unlit: true,
             ..default()
         });
-        (character, shadow)
-    };
-    // Soft radial shadow: a procedural alpha texture reproducing the wgpu
-    // shader's falloff (cube.wgsl fs_shadow), so the Bevy shadow band has
-    // the same partial-alpha footprint as the reference renderer.
     let shadow_texture = world
         .resource_mut::<Assets<Image>>()
         .add(radial_shadow_texture());
@@ -119,38 +207,22 @@ pub(crate) fn spawn_scene(app: &mut App, window: Entity) -> SceneEntities {
         .get_mut(&shadow_material)
         .expect("shadow material")
         .base_color_texture = Some(shadow_texture);
-
-    let character = world
-        .spawn((
-            Mesh3d(character_mesh),
-            MeshMaterial3d(character_material.clone()),
-            Transform::IDENTITY,
-        ))
-        .id();
     let shadow = world
         .spawn((
             Mesh3d(shadow_mesh),
-            MeshMaterial3d(shadow_material),
+            MeshMaterial3d(shadow_material.clone()),
             Transform::IDENTITY,
         ))
         .id();
 
     SceneEntities {
         window,
-        character,
+        root,
         shadow,
-        character_material,
+        elements,
+        parts,
+        shadow_material,
     }
-}
-
-/// Character base color while hovered: a gentle warm brightening, the
-/// Bevy-path equivalent of the wgpu shader's hover tint.
-fn hover_color() -> Color {
-    Color::srgb(1.0, 0.55, 0.42)
-}
-
-fn normal_color() -> Color {
-    Color::srgb(0.94, 0.38, 0.28)
 }
 
 /// A radial-falloff alpha texture for the shadow quad, reproducing
@@ -190,83 +262,80 @@ fn radial_shadow_texture() -> Image {
 }
 
 /// Write one `SceneState` snapshot into the entities before a frame is
-/// extracted. The model matrices are computed by the same formulas (and
-/// the same `crate::math`) as `crate::wgpu`'s renderer; `camera` is the
-/// shared placement camera the renderer keeps framed for the current
-/// logical size.
+/// extracted. All matrices come from the shared placement math
+/// (`crate::scene`), so both backends stay pixel-identical.
 pub(crate) fn sync_scene(
     world: &mut World,
     entities: &SceneEntities,
     state: &SceneState,
     camera: &SceneCamera,
 ) {
-    // Hover tint first: swap the material's base color (cheap; materials
-    // are assets and change detection drives re-extraction).
-    let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
-    if let Some(mut mat) = materials.get_mut(&entities.character_material) {
-        mat.base_color = if state.hover {
-            hover_color()
-        } else {
-            normal_color()
-        };
-    }
-
-    let placement = frame_placement(state, camera);
-
-    let mut character = world.entity_mut(entities.character);
-    character.insert(Transform::from_matrix(to_glam(placement.cube_model)));
-
-    let mut shadow = world.entity_mut(entities.shadow);
-    shadow.insert(Transform::from_matrix(to_glam(placement.shadow_model)));
-}
-
-/// The per-frame model matrices (a pure function of the scene state, shared
-/// with the wgpu backend's render math).
-struct FramePlacement {
-    cube_model: Mat4,
-    shadow_model: Mat4,
-}
-
-fn frame_placement(state: &SceneState, camera: &SceneCamera) -> FramePlacement {
     let placement = camera.placement(state);
 
-    let bob_h = if state.animate {
-        placement.world_h * 0.055 * (state.time * 2.2).sin()
-    } else {
-        0.0
-    };
-    let yaw = if state.animate { state.time * 0.8 } else { 0.0 };
+    // Root pose + shadow from the shared composition functions.
+    let root_model: Mat4 = crate::scene::root_model(&placement, &state.pose.root);
+    let shadow_model: Mat4 = crate::scene::shadow_model(&placement, &state.pose.root);
 
-    let cube_model = math::mat_mul(
-        &math::translate(
-            placement.center[0],
-            placement.center[1] + bob_h * placement.up[1],
-            placement.center[2],
-        ),
-        &math::mat_mul(&math::rotate_y(yaw), &math::scale(placement.world_h)),
-    );
-    let shadow_model = math::billboard(
-        [
-            placement.center[0] - placement.up[0] * placement.world_h * 0.72,
-            placement.center[1] - placement.up[1] * placement.world_h * 0.72 - bob_h * 0.5,
-            placement.center[2] - placement.up[2] * placement.world_h * 0.72,
-        ],
-        [
-            placement.right[0] * placement.world_h * 0.95,
-            placement.right[1] * placement.world_h * 0.95,
-            placement.right[2] * placement.world_h * 0.95,
-        ],
-        [
-            placement.up[0] * placement.world_h * 0.30,
-            placement.up[1] * placement.world_h * 0.30,
-            placement.up[2] * placement.world_h * 0.30,
-        ],
-        placement.forward,
-    );
+    world
+        .entity_mut(entities.root)
+        .insert(Transform::from_matrix(to_glam(root_model)));
+    world
+        .entity_mut(entities.shadow)
+        .insert(Transform::from_matrix(to_glam(shadow_model)));
 
-    FramePlacement {
-        cube_model,
-        shadow_model,
+    // Element poses: per-element scale (sleeping flattens the eyes).
+    for (entity, id) in &entities.elements {
+        let scale = state.pose.element(*id).scale;
+        let Ok(mut element) = world.get_entity_mut(*entity) else {
+            continue;
+        };
+        let mut transform = element.get_mut::<Transform>().expect("element transform");
+        transform.scale = Vec3::new(scale[0].max(0.01), scale[1].max(0.01), scale[2].max(0.01));
+    }
+
+    // Part tints: base × pose tint × hover.
+    {
+        let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+        for (entity, material, element_id, base_color) in &entities.parts {
+            let mut tint = state.pose.element(*element_id).tint;
+            if state.hover == Some(*element_id) {
+                tint = [
+                    (tint[0] * 1.22 + 0.02).min(1.0),
+                    (tint[1] * 1.16 + 0.015).min(1.0),
+                    (tint[2] * 1.06 + 0.01).min(1.0),
+                ];
+            }
+            let target = Color::srgb(
+                (base_color[0] * tint[0]).min(1.0),
+                (base_color[1] * tint[1]).min(1.0),
+                (base_color[2] * tint[2]).min(1.0),
+            );
+            let Some(mut mat) = materials.get_mut(material) else {
+                continue;
+            };
+            // Assign only on change so unchanged frames do not dirty the
+            // asset (re-extraction costs a frame).
+            if mat.base_color != target {
+                mat.base_color = target;
+            }
+            let _ = entity;
+        }
+    }
+
+    // Shadow strength follows the bob (shared formula).
+    let strength = crate::scene::shadow_strength(&state.pose.root);
+    {
+        let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+        let Some(mut mat) = materials.get_mut(&entities.shadow_material) else {
+            return;
+        };
+        // The texture already carries the 0.42 falloff; the material
+        // scales it by strength/0.42.
+        let alpha = (strength / 0.42).clamp(0.0, 1.0);
+        let target = Color::srgba(1.0, 1.0, 1.0, alpha);
+        if mat.base_color != target {
+            mat.base_color = target;
+        }
     }
 }
 

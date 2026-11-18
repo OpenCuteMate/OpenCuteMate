@@ -17,6 +17,7 @@ renderer-bevy = ["ocm-renderer/bevy-backend"]
 
 [dependencies]
 ocm-core.workspace = true
+ocm-character.workspace = true
 ocm-platform.workspace = true
 ocm-platform-wayland.workspace = true
 ocm-renderer.workspace = true
