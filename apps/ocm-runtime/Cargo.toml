@@ -15,6 +15,7 @@ ocm-core.workspace = true
 ocm-platform.workspace = true
 ocm-platform-wayland.workspace = true
 ocm-renderer.workspace = true
+calloop.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
