@@ -138,10 +138,14 @@ impl App {
     }
 
     /// One-shot timer for FPS-cap deferral / retry.
+    ///
+    /// Deduplicated: while one timer is pending, later requests piggyback on
+    /// it — its callback re-arms with the exact remaining delay if it fires
+    /// early. This avoids remove/insert churn (which leaves calloop warning
+    /// about already-queued events for removed sources).
     fn schedule_timer(&mut self, delay: Duration) {
-        if let Some(token) = self.timer.take() {
-            // calloop 0.14: `remove` consumes the token and is infallible.
-            self.loop_handle.remove(token);
+        if self.timer.is_some() {
+            return; // a timer is already pending; its callback re-arms
         }
         match self.loop_handle.insert_source(
             calloop::timer::Timer::from_duration(delay),
@@ -156,6 +160,8 @@ impl App {
     }
 
     fn on_timer(&mut self) {
+        // The timer fired and is gone; consume it before any re-arms.
+        self.timer = None;
         if self.dirty || self.mode == RenderMode::Animated {
             self.maybe_render();
         }

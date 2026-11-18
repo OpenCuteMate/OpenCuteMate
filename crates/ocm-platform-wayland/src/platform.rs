@@ -223,7 +223,10 @@ impl WaylandPlatform {
             tracing::warn!("no wl_seat global; pointer input unavailable");
         }
 
-        // Enumerate wl_output globals and bind each one.
+        // Enumerate wl_output globals and bind each one BY NAME. This is
+        // required for multi-instance globals: `GlobalList::bind` only binds
+        // the first global of an interface (per its own documentation), which
+        // would mis-identify monitors on multi-output systems.
         let mut output_globals: Vec<(u32, u32)> = Vec::new();
         self.globals.contents().with_list(|globals| {
             for global in globals {
@@ -233,27 +236,23 @@ impl WaylandPlatform {
             }
         });
 
+        let registry = self.globals.registry().clone();
         let mut records: Vec<OutputRecord> = Vec::new();
-        for (global_name, _version) in output_globals {
+        for (global_name, advertised_version) in output_globals {
             let index = records.len();
-            match self
-                .globals
-                .bind::<WlOutput, _, _>(&qh, 1..=4, OutputData { index })
-            {
-                Ok(proxy) => {
-                    records.push(OutputRecord {
-                        proxy,
-                        monitor: MonitorInfo {
-                            name: format!("wl_output@{global_name}"),
-                            description: String::new(),
-                            logical_position: None,
-                            logical_size: None,
-                            scale: 1,
-                        },
-                    });
-                }
-                Err(e) => tracing::warn!(global_name, "failed to bind wl_output: {e}"),
-            }
+            // Bind at min(advertised, 4): v4 gives name/description events.
+            let version = advertised_version.min(4);
+            let proxy: WlOutput = registry.bind(global_name, version, &qh, OutputData { index });
+            records.push(OutputRecord {
+                proxy,
+                monitor: MonitorInfo {
+                    name: format!("wl_output@{global_name}"),
+                    description: String::new(),
+                    logical_position: None,
+                    logical_size: None,
+                    scale: 1,
+                },
+            });
         }
 
         // xdg-output for friendly names and logical geometry.

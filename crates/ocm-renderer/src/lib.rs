@@ -224,13 +224,27 @@ impl WgpuRenderer {
             "surface capabilities"
         );
 
-        // Format: first preferred alpha-capable format, avoiding sRGB
-        // variants so shader color math is direct.
+        // Format: prefer 8-bit UNORM alpha formats (the classic ARGB8888
+        // family compositors expect, and a direct match for hand-authored
+        // sRGB-ish shader colors), then any other non-sRGB alpha format,
+        // then any alpha format at all.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| format_has_alpha(*f) && !f.is_srgb())
+            .find(|f| {
+                !f.is_srgb()
+                    && matches!(
+                        f,
+                        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                    )
+            })
+            .or_else(|| {
+                caps.formats
+                    .iter()
+                    .copied()
+                    .find(|f| format_has_alpha(*f) && !f.is_srgb())
+            })
             .or_else(|| caps.formats.iter().copied().find(|f| format_has_alpha(*f)))
             .ok_or_else(|| RendererError::NoAlphaFormat(caps.formats.clone()))?;
 
