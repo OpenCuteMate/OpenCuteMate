@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# OpenCuteMate PoC — automated Niri validation suite.
+# OpenCuteMate — automated Niri validation suite.
 #
-# Runs the PoC inside a NESTED niri instance (deterministic magenta
+# Runs the runtime inside a NESTED niri instance (deterministic magenta
 # background) and validates:
 #   1. protocol: layer-shell surface present on the overlay layer
 #   2. rendering: wgpu init, first frames, idle parking
 #   3. transparency: pixel analysis of a compositor screenshot
-#      (background visible, cube visible, partial-alpha shadow band)
-#   4. input: hover, drag with input-region updates, click-through,
-#      right-click quit — all injected via zwlr_virtual_pointer directly
-#      into the nested compositor (deterministic, and the host session /
-#      physical pointer are never touched)
+#      (background visible, character visible, partial-alpha shadow band)
+#   4. input: hover, click reaction, drag with input-region updates,
+#      click-through, right-click quit — all injected via
+#      zwlr_virtual_pointer directly into the nested compositor
+#      (deterministic, and the host session / physical pointer are never
+#      touched)
 #   5. idle CPU (procfs) and GPU (nvidia-smi, best-effort)
+#   6. Phase 3a character physics (second launch with --physics):
+#      spawn fall -> landing, drag toss with release velocity, bottom-
+#      strip pixel verification, settle + park, teardown
 #
 # Requires: cargo, niri, python3+PIL, magick. No root, no uinput.
 #
@@ -194,6 +198,11 @@ ldd "$APP" 2>/dev/null | grep -qi "libX11\|libxcb" \
 
 # --- idle measurement (before any scripted input) --------------------------------
 say "idle CPU measurement (3 s window, pre-input)"
+# The parked app is expected to consume exactly 0 CPU ticks. A single
+# 10 ms tick with 0 frames presented is scheduler accounting noise
+# (observed ~1 in 4 runs on this host); like the frame-noise case below,
+# one retry separates noise from a real regression: a tick that persists
+# across two consecutive windows fails the check.
 F1=$(grep -c "frame presented" "$APP_LOG" || true)
 U1=$(awk '{print $14+$15}' /proc/$APP_PID/stat 2>/dev/null)
 sleep 3
@@ -201,14 +210,15 @@ U2=$(awk '{print $14+$15}' /proc/$APP_PID/stat 2>/dev/null)
 F2=$(grep -c "frame presented" "$APP_LOG" || true)
 CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 IDLE_MS=$(( (U2-U1) * 1000 / CLK_TCK ))
-if [ "${F2:-0}" -gt "${F1:-0}" ]; then
-  note "frames were presented during the window (outside interference?); retrying once"
+if [ "${F2:-0}" -gt "${F1:-0}" ] || [ "${U2:-1}" -gt "${U1:-0}" ]; then
+  note "idle window showed ${IDLE_MS} ms / ${F2:-0} frames (noise?); measuring once more"
   sleep 2
   F1=$(grep -c "frame presented" "$APP_LOG" || true)
   U1=$(awk '{print $14+$15}' /proc/$APP_PID/stat 2>/dev/null)
   sleep 3
   U2=$(awk '{print $14+$15}' /proc/$APP_PID/stat 2>/dev/null)
   F2=$(grep -c "frame presented" "$APP_LOG" || true)
+  IDLE_MS=$(( (U2-U1) * 1000 / CLK_TCK ))
 fi
 if [ "${U2:-1}" -gt "${U1:-0}" ]; then
   bad "idle CPU ${IDLE_MS} ms over 3 s (expected 0)"
@@ -245,6 +255,19 @@ say "input automation via virtual pointer (exact coordinates, no physical device
 CUBE_A_X=$(python3 -c "print(int(0.5 * $OUT_W))");  CUBE_A_Y=$(python3 -c "print(int(0.55 * $OUT_H))")
 CUBE_B_X=$(python3 -c "print(int(0.22 * $OUT_W))"); CUBE_B_Y=$(python3 -c "print(int(0.30 * $OUT_H))")
 
+# Wait until the app has logged a pattern (input delivery through the
+# nested compositor can lag the script; polls instead of fixed sleeps).
+wait_log() {
+  # wait_log <pattern> <max_seconds>
+  local pattern=$1 max=$2 i
+  for i in $(seq 1 $((max * 4))); do
+    grep -q "$pattern" "$APP_LOG" && return 0
+    kill -0 "$APP_PID" 2>/dev/null || return 1
+    sleep 0.25
+  done
+  return 1
+}
+
 # Hover over the cube (0.5, 0.55) — events must arrive through the hitbox.
 inj move "$CUBE_A_X" "$CUBE_A_Y" "$OUT_W" "$OUT_H"
 sleep 0.8
@@ -254,6 +277,13 @@ grep -q "pointer enter" "$APP_LOG" \
 grep -q "hover state changed" "$APP_LOG" \
   && ok "hover reaction (tint re-render)" \
   || bad "no hover reaction in app log"
+
+# Click ON the character (press + release, no motion): a semantic click
+# reaction on a specific element — distinct from a drag.
+inj click 0x110
+wait_log "character clicked" 10 \
+  && ok "click on the character logged (semantic element reaction)" \
+  || bad "no click reaction in app log"
 
 # Click far from the character (top-left): must NOT reach the app.
 EVENTS_BEFORE=$(grep -c "pointer button" "$APP_LOG" || true)
@@ -267,19 +297,6 @@ if [ "${EVENTS_AFTER:-0}" -eq "${EVENTS_BEFORE:-0}" ]; then
 else
   bad "empty-area click reached the app (input region broken)"
 fi
-
-# Wait until the app has logged a pattern (input delivery through the
-# nested compositor can lag the script; polls instead of fixed sleeps).
-wait_log() {
-  # wait_log <pattern> <max_seconds>
-  local pattern=$1 max=$2 i
-  for i in $(seq 1 $((max * 4))); do
-    grep -q "$pattern" "$APP_LOG" && return 0
-    kill -0 "$APP_PID" 2>/dev/null || return 1
-    sleep 0.25
-  done
-  return 1
-}
 
 # Drag the cube from (0.5, 0.55) to (0.22, 0.3).
 say "dragging the character to (0.22, 0.3)"
@@ -302,7 +319,7 @@ grep -q "drag started" "$APP_LOG" \
   && ok "drag started (press inside hitbox)" \
   || bad "no drag start in app log"
 wait_log "drag ended" 15 \
-  && ok "drag ended (input region followed the character)" \
+  && ok "drag ended (pointer grab released, region restored at the drop position)" \
   || bad "no drag end in app log"
 
 # Screenshot after the drag: the cube must be at (0.22, 0.3) now. Allow a
@@ -349,7 +366,138 @@ grep -q "teardown: dropping renderer (wgpu surface) first" "$APP_LOG" \
 # --- idle render accounting --------------------------------------------------------
 say "idle render accounting"
 FRAMES=$(grep -c "frame presented" "$APP_LOG" || true)
-note "total frames presented: $FRAMES (startup + scripted interactions only; parked otherwise)"
+note "total frames presented: $FRAMES (startup + bounded reactions + scripted interactions; parked otherwise)"
+
+# --- Phase 3a: physics section (second launch, --physics on) -----------------------
+say "character physics (spawn fall, toss, boundaries) — second launch with --physics"
+APP_LOG="$WORK/app-physics.log"
+WAYLAND_DISPLAY="$WLSOCK" RUST_LOG="debug,naga=warn,wgpu=warn,bevy=warn,bevy_render=warn,bevy_pbr=warn,bevy_winit=warn" "$APP" \
+  --renderer "$OCM_RENDERER" \
+  --physics --position 0.5,0.25 --size 0.4 --fps 60 > "$APP_LOG" 2>&1 &
+APP_PID=$!
+
+PARKED=0
+for _ in $(seq 1 200); do
+  if grep -q "rendering parked (idle)" "$APP_LOG"; then PARKED=1; break; fi
+  kill -0 "$APP_PID" 2>/dev/null || break
+  sleep 0.25
+done
+kill -0 "$APP_PID" 2>/dev/null || { bad "physics app exited during startup"; cat "$APP_LOG"; exit 1; }
+[ "$PARKED" -eq 1 ] || { bad "physics app never parked after the spawn fall"; kill "$APP_PID"; exit 1; }
+
+grep -q 'phase="falling"' "$APP_LOG" \
+  && ok "spawn state: character initialized airborne (phase=falling)" \
+  || bad "no airborne init logged (physics off?)"
+grep -q "character landed" "$APP_LOG" \
+  && ok "spawn fall ended on the floor (character landed)" \
+  || bad "no landing logged after the spawn fall"
+ok "physics app parked after settling (idle again)"
+
+# Grounded position: anchor at 1 - size/2 = 0.8 of the output height.
+GROUND_Y=$(python3 -c "print(int(0.8 * $OUT_H))")
+GROUND_X=$(python3 -c "print(int(0.5 * $OUT_W))")
+
+# Idle after landing: zero frames while parked.
+F1=$(grep -c "frame presented" "$APP_LOG" || true)
+sleep 2
+F2=$(grep -c "frame presented" "$APP_LOG" || true)
+if [ "${F2:-0}" -eq "${F1:-0}" ]; then
+  ok "settled character renders nothing while parked (2 s, 0 frames)"
+else
+  bad "frames presented while parked after landing"
+fi
+
+# Toss: grab the grounded character, drag up and left, release mid-motion.
+# Releasing above the floor with velocity must produce a second landing.
+inj move "$GROUND_X" "$GROUND_Y" "$OUT_W" "$OUT_H"
+sleep 0.4
+inj down 0x110
+sleep 0.2
+for f in 0.46 0.42 0.38 0.34 0.30; do
+  inj move "$(python3 -c "print(int($f*$OUT_W))")" "$(python3 -c "print(int(0.6*$OUT_H))")" "$OUT_W" "$OUT_H"
+  sleep 0.05
+done
+inj up 0x110
+LANDINGS=$(grep -c "character landed" "$APP_LOG" || true)
+# Poll until a SECOND landing appears (the toss fall + wall/slide settle).
+for _ in $(seq 1 80); do
+  LANDINGS2=$(grep -c "character landed" "$APP_LOG" || true)
+  [ "${LANDINGS2:-0}" -gt "${LANDINGS:-0}" ] && break
+  kill -0 "$APP_PID" 2>/dev/null || break
+  sleep 0.25
+done
+if [ "${LANDINGS2:-0}" -gt "${LANDINGS:-0}" ]; then
+  ok "toss: character released mid-drag fell and landed again"
+else
+  bad "toss produced no second landing"
+fi
+grep -q "drag started" "$APP_LOG" && grep -q "drag ended" "$APP_LOG" \
+  && ok "physics drag lifecycle logged" \
+  || bad "physics drag lifecycle missing in log"
+
+# Settled again (park) before the pixel check.
+PARKED2=0
+for _ in $(seq 1 120); do
+  P=$(grep -c "rendering parked (idle)" "$APP_LOG" || true)
+  if [ "${P:-0}" -ge 2 ]; then PARKED2=1; break; fi
+  kill -0 "$APP_PID" 2>/dev/null || break
+  sleep 0.25
+done
+[ "$PARKED2" -eq 1 ] \
+  && ok "character parked again after the toss settled" \
+  || bad "character never parked after the toss"
+
+# Pixel check: the character rests in the bottom strip after the toss.
+rm -f "$WORK/screen.png"
+NIRI_SOCKET="$IPCSOCK" niri msg action screenshot-screen
+for _ in $(seq 1 40); do [ -s "$WORK/screen.png" ] && break; sleep 0.2; done
+TOSS_X=$(python3 - "$WORK/screen.png" "$OUT_W" "$OUT_H" <<'EOF'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert("RGB")
+iw, ih = img.size
+w, h = float(sys.argv[2]), float(sys.argv[3])
+sx, sy = iw / w, ih / h
+y0, y1 = int(h * 0.62 * sy), int(h * 0.98 * sy)
+xs = []
+for yy in range(y0, min(y1, ih), 4):
+    for xx in range(0, iw, 4):
+        r, g, b = img.getpixel((xx, yy))
+        if abs(r - 255) > 60 or g > 60 or abs(b - 255) > 60:
+            xs.append(xx)
+print(int(sum(xs) / len(xs) / sx) if xs else -1)
+EOF
+)
+if [ "${TOSS_X:-0}" -ge 0 ]; then
+  ok "character pixel-verified resting on the bottom strip (x≈$TOSS_X)"
+else
+  bad "no character pixels found in the bottom strip after the toss"
+fi
+
+# Teardown: right-click the resting character (its exact x from the scan).
+if [ "${TOSS_X:--1}" -ge 0 ]; then
+  inj move "$TOSS_X" "$GROUND_Y" "$OUT_W" "$OUT_H"
+  sleep 0.4
+  inj click 0x111
+  EXIT_CODE=-1
+  for _ in $(seq 1 40); do
+    kill -0 "$APP_PID" 2>/dev/null || { wait "$APP_PID"; EXIT_CODE=$?; break; }
+    sleep 0.2
+  done
+  if [ "$EXIT_CODE" -eq 0 ]; then
+    ok "physics app exited cleanly via right-click (exit 0)"
+  else
+    kill "$APP_PID" 2>/dev/null
+    bad "physics app did not quit on right-click (last exit=$EXIT_CODE)"
+  fi
+  grep -q "teardown: dropping renderer (wgpu surface) first" "$APP_LOG" \
+    && grep -q "teardown: dropping platform/wayland session" "$APP_LOG" \
+    && grep -q "teardown complete" "$APP_LOG" \
+    && ok "physics run teardown order logged: renderer before platform" \
+    || bad "physics run teardown order not fully logged"
+else
+  kill "$APP_PID" 2>/dev/null
+fi
 
 # --- idle measurement #2: post-quit proof from the parked window --------------------
 say "summary: PASS=$PASS FAIL=$FAIL"

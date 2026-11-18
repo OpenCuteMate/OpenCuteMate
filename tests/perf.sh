@@ -89,7 +89,11 @@ def parse(path):
         m = re.match(r"(\S+)", line)
         if not m:
             continue
-        t = datetime.fromisoformat(m.group(1).rstrip("Z"))
+        try:
+            t = datetime.fromisoformat(m.group(1).rstrip("Z"))
+        except ValueError:
+            # Not a timestamped log line (e.g. a multi-line engine warning).
+            continue
         if "starting OpenCuteMate" in line and start is None:
             start = t
         if "event loop running" in line and loop is None:
