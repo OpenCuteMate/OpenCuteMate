@@ -88,6 +88,10 @@ pub struct CharacterConfig {
     pub size: f32,
     /// Continuous animation (bob + spin) driven by frame callbacks.
     pub animate: bool,
+    /// Enable character physics: gravity, falling after a drag release and
+    /// collision with the output bounds. Default off: the character rests
+    /// where it is placed (the validated Phase 2 behavior).
+    pub physics: bool,
 }
 
 impl Default for CharacterConfig {
@@ -98,6 +102,7 @@ impl Default for CharacterConfig {
             position_y: 0.5,
             size: 0.4,
             animate: false,
+            physics: false,
         }
     }
 }
@@ -184,6 +189,7 @@ mod tests {
         assert_eq!(cfg.character.position_y, 0.5);
         assert_eq!(cfg.character.size, 0.4);
         assert!(!cfg.character.animate);
+        assert!(!cfg.character.physics);
     }
 
     #[test]
@@ -209,6 +215,7 @@ mod tests {
             position_y = 0.75
             size = 0.6
             animate = true
+            physics = true
             "#,
         )
         .unwrap();
@@ -220,6 +227,7 @@ mod tests {
         assert_eq!(cfg.character.position_y, 0.75);
         assert_eq!(cfg.character.size, 0.6);
         assert!(cfg.character.animate);
+        assert!(cfg.character.physics);
     }
 
     #[test]

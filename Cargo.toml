@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ocm-core",
+    "crates/ocm-character",
     "crates/ocm-platform",
     "crates/ocm-platform-wayland",
     "crates/ocm-renderer",
@@ -44,6 +45,7 @@ thiserror = "2"
 
 # Internal crates
 ocm-core = { path = "crates/ocm-core" }
+ocm-character = { path = "crates/ocm-character" }
 ocm-platform = { path = "crates/ocm-platform" }
 ocm-platform-wayland = { path = "crates/ocm-platform-wayland" }
 ocm-renderer = { path = "crates/ocm-renderer" }

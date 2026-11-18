@@ -2442,6 +2442,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocm-character"
+version = "0.1.0"
+dependencies = [
+ "ocm-core",
+ "ocm-platform",
+ "tracing",
+]
+
+[[package]]
 name = "ocm-core"
 version = "0.1.0"
 dependencies = [

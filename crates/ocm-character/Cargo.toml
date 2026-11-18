@@ -1,0 +1,15 @@
+[package]
+name = "ocm-character"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ocm-core.workspace = true
+# Platform-NEUTRAL types only (Rect, PointerEvent): this crate must never
+# see a Wayland/wgpu type. The dependency exists so the interaction system
+# can consume the same input vocabulary the runtime already routes.
+ocm-platform.workspace = true
+tracing.workspace = true
