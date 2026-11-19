@@ -1,26 +1,26 @@
 //! Desktop environment abstraction.
 //!
-//! The only capability the current platform stack can support **reliably**
-//! is the geometry of the output the overlay lives on: its logical size.
-//! Everything a Wayland layer-shell client can know about the desktop is
-//! derivable from that (floor, walls, per-output placement via the
-//! existing output selection in `ocm-platform`).
+//! The character crate's own view of the desktop: the logical bounds of
+//! the output it lives on (top-left origin, logical pixels). Physics,
+//! drag clamping and floor/wall logic are all stated in this
+//! output-local frame; the runtime derives it from the layer-shell
+//! configure and reconciles it with the neutral desktop environment's
+//! work area when the compositor reports one (see the Phase 3b
+//! `ocm-desktop` / `ocm-desktop-niri` crates and
+//! `docs/desktop-awareness.md`).
 //!
 //! ## What is deliberately NOT here
 //!
-//! A plain layer-shell client cannot see other windows: there is no
-//! standard Wayland protocol exposing foreign-window geometry, stacking
-//! or focus to arbitrary clients. `zwlr_layer_shell` has no window-list
-//! request; ext-workspace/foreign-toplevel protocols cover *toplevel*
-//! windows but require the compositor to advertise them and do not give
-//! reliable pixel geometry to overlay clients — and Niri does not expose
-//! them to layer-shell clients today. OpenCuteMate therefore does **not**
-//! pretend to know window positions: no fake window detection, no
-//! per-window collision. Future desktop interactions that need window
-//! knowledge (walking behind windows, reacting to focus changes) will
-//! require compositor-specific protocols or helper integration and must
-//! be added here as explicitly optional capabilities, never as
-//! assumptions baked into the character crate.
+//! Everything environmental that the compositor must provide: window
+//! geometry, focus, work areas, multi-output layout. That knowledge
+//! lives in the neutral `ocm-desktop` model and arrives through its
+//! providers — the character never talks to a compositor. On Niri,
+//! window pixel geometry exists only for floating windows and
+//! minimized/maximized/fullscreen are not exposed at all; such gaps are
+//! represented as absent data, never guesses. Future desktop
+//! interactions that consume windows (walking on them, reacting to
+//! focus changes) will read the neutral environment through the runtime,
+//! never compositor APIs.
 
 /// The currently knowable desktop geometry: the logical bounds of the
 /// output the character lives on (top-left origin).

@@ -58,20 +58,36 @@ Hard constraints derived from the approved plan:
     │   │ animation           │                     │
     │   └────────────────────┘                     │
     │        model + pose types flow to ocm-renderer│
+    │                                              │
+    │  ┌──────────────────────────────────────────┐│
+    │  │ ocm-desktop (Phase 3b)                   ││
+    │  │ neutral desktop model, layout, provider  ││
+    │  │ contract, environment accumulator        ││
+    │  └──────────▲───────────────────────────────┘│
+    │             │                                │
+    │  ┌──────────┴───────────────────────────────┐│
+    │  │ ocm-desktop-niri (Phase 3b)              ││
+    │  │ Niri IPC provider + calloop event source ││
+    │  └──────────────────────────────────────────┘│
 ┌───┴────────────────────────┴──────────────────────┴───────────┐
 │                        ocm-runtime                            │
 │  CLI (clap), config loading, character + platform + renderer   │
 │  wiring, main loop (calloop), scheduler, input-region policy, │
-│  teardown ordering                                            │
+│  teardown ordering, desktop environment integration (Phase 3b) │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 Dependency directions (enforced by Cargo manifests, [Verified] by inspection):
 
-- `ocm-runtime` → `ocm-core`, `ocm-character`, `ocm-platform`,
-  `ocm-platform-wayland`, `ocm-renderer`.
+- `ocm-runtime` → `ocm-core`, `ocm-character`, `ocm-desktop`,
+  `ocm-desktop-niri`, `ocm-platform`, `ocm-platform-wayland`,
+  `ocm-renderer`.
 - `ocm-character` → `ocm-core`, `ocm-platform` — only the **neutral**
   types (`Rect`, `PointerEvent`); never a Wayland or GPU type.
+- `ocm-desktop` → `ocm-platform` (the `Rect` type) only — pure model,
+  no compositor, no renderer.
+- `ocm-desktop-niri` → `ocm-desktop` (+ `serde`, `serde_json`,
+  `calloop`); niri specifics never leak past it.
 - `ocm-renderer` → `ocm-core`, `ocm-character` (model + pose types),
   `ocm-platform` (+ `wgpu`, `raw-window-handle`, `bytemuck`, `pollster`).
 - `ocm-renderer` does **not** depend on `wayland-*` crates of any kind.
@@ -85,6 +101,8 @@ Dependency directions (enforced by Cargo manifests, [Verified] by inspection):
 | `ocm-core` | `Config` (TOML schema), `Layer`, `KeyboardInteractivity`, error enums, `tracing` init | Wayland, wgpu, character state |
 | `ocm-character` | Semantic model elements + roles, the character state machine (`Phase`), pointer-interaction interpretation, deterministic physics, the animation seam (`AnimatedPose`), desktop output bounds | Wayland, wgpu, Bevy, renderer types |
 | `ocm-platform` | `PlatformEvent`, `PointerEvent`, `Rect`, `NativeHandles`, `OverlaySurface`/`Platform` traits, `MonitorInfo` | Any concrete windowing stack |
+| `ocm-desktop` | Neutral desktop environment model (outputs, windows, workspaces, capabilities), `EnvironmentEvent`s, `DesktopEnvironment` accumulator, region-based `DesktopLayout`, `DesktopProvider` contract | Any compositor, protocol or renderer |
+| `ocm-desktop-niri` | Niri IPC socket client, wire-format mirrors, `NiriProvider` (snapshot/event stream/output re-poll), calloop `NiriSource` | Rendering, character behavior |
 | `ocm-platform-wayland` | Connection, registry, globals, layer surface, `wl_seat`/`wl_pointer`, `wl_output` + `zxdg_output`, fractional-scale + viewporter, frame callbacks, calloop `EventSource` | wgpu, render math, character logic |
 | `ocm-renderer` | wgpu instance/device/queue, surface creation from raw handles, pipelines, part-based model drawing, camera + per-element hitbox math | Wayland client types, character behavior |
 | `ocm-runtime` | CLI/config merge, character + platform + renderer construction, scheduler, sleep timer, input-region policy (grab ↔ element rects, deduplicated), teardown | Protocol details |
@@ -466,3 +484,30 @@ validated by the same automated suite on the same day:
   (113 vs 27 ms/s release @60 fps), ~250 MB more memory and ~0.9 s more
   startup, and paces at 18.4 ms mean (release) vs the wgpu renderer's
   17.0 ms.
+
+## 18. Phase 3b: desktop environment awareness (2026-11-19)
+
+The desktop awareness subsystem lives beside everything above and
+changes no validated behavior:
+
+- **`ocm-desktop`** (new, pure): the neutral desktop model — outputs,
+  work areas, windows, window states, workspaces, capabilities — plus
+  `EnvironmentEvent`s, the `DesktopEnvironment` accumulator with
+  id-keyed diffing, the region-based `DesktopLayout` with all
+  coordinate-space conversions, and the `DesktopProvider` contract.
+- **`ocm-desktop-niri`** (new): the provider for Niri 26.04, speaking
+  its JSON IPC directly over `$NIRI_SOCKET` (no subprocesses): a
+  persistent event stream (full state up-front, then
+  workspaces/windows/focus/layout events), one-shot output re-polls
+  (the event stream has no output events), and a calloop source that
+  degrades to `ProviderLost` + `PostAction::Remove` instead of killing
+  the loop.
+- **Runtime integration:** optional (`--no-desktop`; an absent/dead
+  socket means "run without awareness"), event-driven (a 6-window churn
+  storm schedules 0 frames), bounds reconciled with the environment's
+  work area only on real changes, window-overlap awareness logged for
+  future behavior phases.
+- Full design, verified Niri facts, coordinate conventions, capability
+  matrix and measurements: `docs/desktop-awareness.md`.
+- Suite: 45 checks per renderer backend (was 30; 15 new awareness
+  checks), passing for `--renderer wgpu` and `--renderer bevy`.

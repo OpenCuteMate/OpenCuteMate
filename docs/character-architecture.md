@@ -43,7 +43,7 @@ can plug into without touching the interaction or behavior code.
 | Model representation: hierarchy, parts, semantic mapping | `ocm-character::model` | The prototype cube is data, not code, in the renderers |
 | Gravity/velocity/falling/boundary collision | `ocm-character::physics` | Deterministic, pure; no Rapier |
 | Animation: procedural now, clip/expression later | `ocm-character::animation` | Renderer-neutral `AnimatedPose` output |
-| Desktop environment abstraction | `ocm-character::desktop` | Output bounds today; window awareness documented impossible (§7) |
+| Desktop environment abstraction | `ocm-character::desktop` | Output-local bounds for physics; the neutral environment lives in `ocm-desktop` (Phase 3b, §7) |
 | Wayland events, Layer Shell, input regions, scheduling, teardown | `ocm-platform-wayland` + `ocm-runtime` | **Unchanged from Phase 2**; input regions stay runtime-owned |
 
 Dependency rules (enforced by manifests):
@@ -254,25 +254,43 @@ stores elements as a real entity hierarchy, so bones map onto it.
 
 ## 7. Desktop environment interactions
 
-Implemented: `DesktopBounds` — the logical size of the output the
-character lives on, fed from the layer-shell configure. From it:
-the floor (`height − half-extent`), walls, spawn clamp and the
-drag clamp. Output *selection* (which monitor) stays with the existing
-platform output discovery.
+**Phase 3b update:** the character now has a real desktop environment
+behind it — see `docs/desktop-awareness.md` for the full design. The
+summary:
 
-**Deliberately not implemented** (and not faked): window detection,
-window positions, focus events, per-window occlusion. A plain layer
-shell client has no standard protocol to see foreign windows; Niri does
-not expose toplevel geometry to layer-shell clients. Anything in that
-direction requires compositor-specific integration (e.g. ext-foreign-
-toplevel with geometry cooperation, or a companion niri plugin) and will
-be added to `ocm-character::desktop` as an *optional* capability — never
-as an assumption. No fake window detection exists in this codebase.
+- **`ocm-desktop`** (new pure crate) is the neutral environmental
+  model: outputs (geometry/scale/transform/physical mode/work area),
+  windows (identity, workspace, state flags, optional geometry),
+  workspaces, capability reports, environmental events, a state
+  accumulator and a region-based coordinate model
+  (`DesktopLayout`: multi-output, gaps, negative positions, per-output
+  scales — the desktop is never assumed to be one rectangle).
+- **`ocm-desktop-niri`** feeds it from the Niri IPC (event stream +
+  snapshot + output re-poll). Verified truths: window pixel geometry
+  only for floating windows; no minimized/maximized/fullscreen, no work
+  areas, no primary output on Niri — all represented as `None`/false,
+  never guessed.
+- **The character itself is unchanged.** It still lives in
+  `DesktopBounds` (its output's local logical frame, from the
+  layer-shell configure), which the runtime now reconciles with the
+  environment's work area when the compositor reports one (Niri does
+  not, so behavior is value-identical). Window/workspace events update
+  the environment and never wake the character or the scheduler; the
+  runtime logs window-overlap awareness as the integration boundary
+  for future behaviors (walking on windows, reacting to windows moving
+  underneath — planned, not implemented).
+- Multi-output movement remains future work (one surface per output or
+  layer-shell re-assignment — see desktop-awareness.md §9).
 
-Multi-monitor: output discovery/selection works today (Phase 2, live
-session). A character "walking" between outputs requires either one
-surface per output or layer-shell output re-assignment — deferred to a
-later phase with the same honesty rule.
+Historical context (Phase 3a, still true): a plain layer-shell client
+has no standard protocol for foreign windows; standard Wayland cannot
+provide this. What changed in Phase 3b is the *delivery mechanism*:
+Niri's compositor-specific IPC provides honest, verified window and
+workspace data to a provider, which is why the awareness lives behind
+the neutral `DesktopProvider` contract — compositor-specific code stays
+in `ocm-desktop-niri`, the character never sees it. No fake window
+detection exists anywhere; every `Option` gap is a documented
+compositor limitation.
 
 ## 8. Scheduler integration (idle cost)
 
@@ -349,8 +367,9 @@ Both backends now draw the model they are handed:
 - The Bevy backend's per-frame cost (measured Phase 2b: ~4–6× wgpu per
   frame) is inherited unchanged; character parts add draw calls, not
   systems.
-- Window/desktop awareness: impossible without compositor cooperation
-  (see §7); nothing is faked.
+- Window/desktop awareness: delivered via the neutral `ocm-desktop`
+  providers (Phase 3b); the character itself still consumes only
+  output-local bounds, and window-based behaviors are future work (§7).
 
 ## 11. Phase 3a results (2026-11-19)
 

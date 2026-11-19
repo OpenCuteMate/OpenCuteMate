@@ -3,12 +3,13 @@
 An open-source desktop companion (in the spirit of Desktop Mate) — animated
 characters that live on your desktop.
 
-**Status: Phases 1, 2 and 2b complete; Phase 3a implemented — a first
-character (the prototype cube with a face) runs on a generic
-character/interaction architecture: semantic model elements, an explicit
-state machine, pointer interaction with per-element identification,
-deterministic physics and a renderer-neutral animation seam — across two
-interchangeable renderers.**
+**Status: Phases 1, 2, 2b and 3a complete; Phase 3b implemented — the
+character now has desktop environment awareness: a compositor-neutral
+model of the desktop it lives in (outputs with per-output scales and
+transforms, work areas, windows with honest capability reporting,
+workspaces), fed by a Niri IPC provider over a persistent event stream,
+with region-based multi-display coordinate math and an event-driven
+runtime integration that never wakes the idle character.**
 
 Phase 2 proved the core architectural assumption:
 
@@ -33,6 +34,18 @@ Phase 3a builds the character system on top:
   floor; opt-in via `--physics`), and the animation seam
   (`AnimatedPose`) that future glTF clips and VRM expressions plug
   into.
+- **`ocm-desktop`** + **`ocm-desktop-niri`** (Phase 3b, new crates): the
+  environmental foundation. `ocm-desktop` is pure and compositor-neutral
+  (outputs, work areas, windows, workspaces, capability reports,
+  environmental events, the `DesktopEnvironment` accumulator, and the
+  region-based `DesktopLayout` for multi-display coordinate math —
+  gaps, negative positions, per-output scales). `ocm-desktop-niri`
+  implements the provider over Niri's JSON IPC socket directly (no
+  subprocesses): full state up-front, then windows/workspaces/focus
+  events pushed; outputs re-polled cheaply (the event stream has no
+  output events). Everything the compositor can't provide (Niri: work
+  areas, primary output, minimized/maximized/fullscreen flags, tiled
+  window positions) is reported as unavailable, never faked.
 - Both renderers draw arbitrary element/part models and compute
   per-element hitboxes from the same camera math — the single source
   of truth for what is where on screen.
@@ -40,15 +53,22 @@ Phase 3a builds the character system on top:
   surface while dragging), so a drag can never outrun the character;
   input-region commits are deduplicated.
 - The scheduler still parks at zero CPU/GPU; animations are bounded
-  one-shots that request frames only while they run.
+  one-shots that request frames only while they run, and
+  environmental events never schedule a frame (verified: a
+  window-churn storm schedules zero frames).
 
 On the development machine (Niri 26.04, NVIDIA RTX 5050, 1.25×
-fractional scaling) the automated suite passes **30/30 for both
+fractional scaling) the automated suite passes **45/45 for both
 `--renderer wgpu` and `--renderer bevy`**: pixel-verified transparency,
 element-level hover/click reactions, dragging with input-region
 updates, click-through, right-click quit, physics (spawn fall →
 landing, drag-toss with release velocity → wall/floor settle), idle
-0-tick/0-frame parking, and teardown order. Hyprland validation
+0-tick/0-frame parking, teardown order — plus the Phase 3b checks:
+desktop snapshot vs the compositor's own view, window
+open/float/focus/close and workspace events through the persistent
+subscription, floating-window geometry pixel-verified against a
+compositor screenshot, 0 idle CPU with the event stream attached, and
+graceful operation without the compositor IPC. Hyprland validation
 remains prepared but blocked by a nested-Hyprland startup deadlock
 outside this project's code — see `docs/compositor-compatibility.md`
 §4.
@@ -59,6 +79,10 @@ outside this project's code — see `docs/compositor-compatibility.md`
 crates/ocm-core              config (TOML), errors, logging
 crates/ocm-character        model elements, state machine, interaction,
                              physics, animation (pure, Phase 3a)
+crates/ocm-desktop          neutral desktop environment model, layout
+                             math, provider contract (Phase 3b)
+crates/ocm-desktop-niri     Niri IPC desktop provider + calloop source
+                             (Phase 3b)
 crates/ocm-platform          platform-neutral traits, events, raw-handle bridge
 crates/ocm-platform-wayland  layer-shell, input, outputs, fractional scale, calloop source
 crates/ocm-renderer          wgpu 30 backend + Bevy 0.20 backend (shared placement math)
@@ -85,12 +109,22 @@ click it (squash reaction), drag it (it follows, tilts with speed;
 release while moving to toss it), right-click it to quit. After 60 s
 untouched it falls asleep; any pointer contact wakes it.
 
+Desktop awareness attaches automatically when a Niri IPC socket exists
+(`--no-desktop` disables it): the runtime acquires an environment
+snapshot and stays updated via the compositor's event stream, logs
+window-overlap awareness for future behaviors, and reconciles the
+character's bounds with the compositor's work area when one is
+reported (Niri does not expose work areas — behavior is unchanged
+there).
+
 ## Documentation
 
 - `docs/architecture.md` — crate graph, lifetimes, teardown order, scheduler
 - `docs/character-architecture.md` — character system, state machine,
   semantic elements, interaction flow, physics, animation seam, future
   glTF/VRM integration, current limitations
+- `docs/desktop-awareness.md` — Phase 3b: environment model, coordinate
+  spaces, Niri IPC findings, provider guide, capability matrix, perf
 - `docs/bevy-integration.md` — Phase 2b research, pitfalls, results, perf
 - `docs/engine-comparison.md` — Bevy vs Godot vs raw wgpu
 - `docs/wayland-feasibility.md` — layer shell, alpha modes, raw-handle GPU surfaces
