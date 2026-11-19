@@ -4,6 +4,7 @@ members = [
     "crates/ocm-core",
     "crates/ocm-character",
     "crates/ocm-desktop",
+    "crates/ocm-desktop-niri",
     "crates/ocm-platform",
     "crates/ocm-platform-wayland",
     "crates/ocm-renderer",
@@ -49,6 +50,7 @@ thiserror = "2"
 ocm-core = { path = "crates/ocm-core" }
 ocm-character = { path = "crates/ocm-character" }
 ocm-desktop = { path = "crates/ocm-desktop" }
+ocm-desktop-niri = { path = "crates/ocm-desktop-niri" }
 ocm-platform = { path = "crates/ocm-platform" }
 ocm-platform-wayland = { path = "crates/ocm-platform-wayland" }
 ocm-renderer = { path = "crates/ocm-renderer" }

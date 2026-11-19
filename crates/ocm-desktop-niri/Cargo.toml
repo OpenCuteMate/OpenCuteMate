@@ -1,0 +1,20 @@
+[package]
+name = "ocm-desktop-niri"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ocm-desktop.workspace = true
+# The Niri IPC is JSON over a Unix socket (the niri-ipc wire format). We
+# speak it directly instead of shelling out to `niri msg` or depending on
+# the (version-locked) niri-ipc crate: zero subprocesses, and the few
+# mirrored types are pinned here with tests against captured wire data.
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+# The event source integrates with the runtime's existing calloop loop.
+calloop.workspace = true
