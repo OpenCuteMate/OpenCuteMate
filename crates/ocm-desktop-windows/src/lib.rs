@@ -177,12 +177,21 @@ mod provider {
 
     #![cfg(windows)]
 
+    use std::collections::BTreeMap;
+
     use super::api_error;
-    use ocm_desktop::{DesktopSnapshot, EnvironmentEvent, OutputInfo, ProviderError};
+    use ocm_desktop::{DesktopSnapshot, EnvironmentEvent, OutputInfo, ProviderError, WindowInfo};
 
     use crate::{api, translate};
 
-    pub struct State;
+    pub struct State {
+        /// Last known window records (seeded by the snapshot, patched
+        /// by events later): the event path needs full records and
+        /// removal detection.
+        windows: BTreeMap<u64, WindowInfo>,
+        /// Per-pid executable names (queried once per process).
+        exe_cache: api::ExeCache,
+    }
 
     impl State {
         pub fn connect() -> Result<Self, ProviderError> {
@@ -193,13 +202,23 @@ mod provider {
                 return Err(ProviderError::Unavailable);
             }
             tracing::debug!(monitors = monitors.len(), "win32 monitor discovery ok");
-            Ok(Self)
+            Ok(Self {
+                windows: BTreeMap::new(),
+                exe_cache: BTreeMap::new(),
+            })
         }
 
         pub fn snapshot(&mut self) -> Result<DesktopSnapshot, ProviderError> {
+            let raw_windows = api::enumerate_windows(&mut self.exe_cache).map_err(api_error)?;
+            let windows: Vec<WindowInfo> = raw_windows
+                .iter()
+                .filter_map(translate::window_to_info)
+                .collect();
+            self.windows = windows.iter().map(|w| (w.id, w.clone())).collect();
+            tracing::debug!(windows = windows.len(), "win32 window enumeration ok");
             Ok(DesktopSnapshot {
                 outputs: translate::monitors_to_info(&api::monitors().map_err(api_error)?),
-                windows: Vec::new(),
+                windows,
                 workspaces: Vec::new(),
             })
         }

@@ -31,7 +31,9 @@
 // on other platforms only its tests consume it.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use ocm_desktop::{OutputInfo, OutputPhysical, OutputTransform};
+use ocm_desktop::{
+    OutputInfo, OutputPhysical, OutputTransform, WindowGeometry, WindowInfo, WindowState,
+};
 
 /// Windows' `DEVMODE.dmDisplayOrientation` values (physical constants,
 /// mirrored here so the translation is testable on every OS).
@@ -156,4 +158,111 @@ pub fn monitors_to_info(monitors: &[RawMonitor]) -> Vec<OutputInfo> {
     let mut outputs: Vec<OutputInfo> = monitors.iter().map(monitor_to_info).collect();
     outputs.sort_by(|a, b| a.id.cmp(&b.id));
     outputs
+}
+
+// ---------------------------------------------------------------------------
+// Windows
+// ---------------------------------------------------------------------------
+
+/// A toplevel window as observed through the Win32 window APIs —
+/// physical pixels, filled by the cfg(windows) API layer.
+///
+/// `frame` is the **visible window rectangle**: DWM extended frame
+/// bounds when available (excludes the invisible resize borders
+/// `GetWindowRect` includes), falling back to `GetWindowRect`. This is
+/// the rectangle the neutral `WindowInfo.geometry` represents, and it
+/// is the same thing the user perceives as "the window".
+#[derive(Debug, Clone)]
+pub struct RawWindow {
+    /// HWND as an opaque id (stable for the window's lifetime).
+    pub hwnd: u64,
+    /// Title text (`GetWindowTextW`), empty when the window has none.
+    pub title: String,
+    /// Executable file stem, lowercased (`firefox`, `explorer`), when
+    /// the process could be opened (privileged processes cannot).
+    pub exe: Option<String>,
+    pub pid: Option<u32>,
+    /// DWM extended frame bounds / `GetWindowRect` fallback (physical:
+    /// left, top, right, bottom in the virtual-screen space).
+    pub frame: (i32, i32, i32, i32),
+    /// `IsWindowVisible`.
+    pub visible: bool,
+    /// `IsIconic`.
+    pub minimized: bool,
+    /// `IsZoomed`.
+    pub maximized: bool,
+    /// Equal to the foreground window at enumeration time.
+    pub foreground: bool,
+    /// DWMWA_CLOAKED != 0 (e.g. suspended UWP apps: alive, not on
+    /// screen).
+    pub cloaked: bool,
+    /// `WS_EX_TOOLWINDOW` (palettes, toolbars — not task-switchable).
+    pub tool_window: bool,
+    /// Effective DPI of the monitor the window is on (used for the
+    /// physical→logical conversion; `MonitorFromWindow` +
+    /// `GetDpiForMonitor`).
+    pub monitor_dpi: u32,
+}
+
+/// Window relevance filter (pure, fixture-testable).
+///
+/// Excluded — and why:
+/// - **invisible**: not on screen at all (`IsWindowVisible` covers the
+///   parent chain);
+/// - **cloaked**: suspended UWP apps that are "alive" per Win32 but not
+///   rendered (`DWMWA_CLOAKED`);
+/// - **tool windows** (`WS_EX_TOOLWINDOW`): palettes and toolbars that
+///   the shell itself excludes from the task switcher.
+///
+/// Everything else `EnumWindows` reports is kept — owned dialogs,
+/// console windows, browser popups included — so legitimate
+/// applications are never over-filtered.
+pub fn is_relevant_window(raw: &RawWindow) -> bool {
+    raw.visible && !raw.cloaked && !raw.tool_window
+}
+
+/// Raw window → neutral [`WindowInfo`], or `None` when filtered out or
+/// when there is nothing honest to report.
+///
+/// Geometry conversion uses the window's monitor DPI (physical ÷
+/// scale, exact). Minimized windows have no on-screen position
+/// (`GetWindowRect` reports the -32000 parking spot), so their
+/// geometry is `None` — absence, not a guess.
+pub fn window_to_info(raw: &RawWindow) -> Option<WindowInfo> {
+    if !is_relevant_window(raw) {
+        return None;
+    }
+    let scale = scale_from_dpi(raw.monitor_dpi);
+    let geometry = if raw.minimized {
+        None
+    } else {
+        let (x, y, width, height) = physical_rect_to_logical(raw.frame, scale);
+        Some(WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+        })
+    };
+    Some(WindowInfo {
+        id: raw.hwnd,
+        title: (!raw.title.is_empty()).then_some(raw.title.clone()),
+        app_id: raw.exe.clone(),
+        pid: raw.pid,
+        workspace_id: None,
+        state: WindowState {
+            focused: Some(raw.foreground),
+            minimized: Some(raw.minimized),
+            maximized: Some(raw.maximized),
+            // Rect-vs-monitor comparison would be a heuristic: refused.
+            fullscreen: None,
+            // Windows has no tiling/floating concept to report.
+            floating: None,
+            visible: Some(raw.visible),
+            // Deliberate no: Windows' "urgent" is a flash request we do
+            // not subscribe to, not a state we can query honestly.
+            urgent: None,
+        },
+        geometry,
+    })
 }

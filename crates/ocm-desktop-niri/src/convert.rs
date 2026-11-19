@@ -96,6 +96,8 @@ pub struct NiriWindow {
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
+    pub pid: Option<i32>,
+    #[serde(default)]
     pub workspace_id: Option<u64>,
     pub is_focused: bool,
     pub is_floating: bool,
@@ -214,6 +216,7 @@ pub fn window_to_info(window: NiriWindow) -> WindowInfo {
         id,
         title,
         app_id,
+        pid,
         workspace_id,
         is_focused,
         is_floating,
@@ -224,6 +227,9 @@ pub fn window_to_info(window: NiriWindow) -> WindowInfo {
         id,
         title,
         app_id,
+        // Niri types the pid as i32; a negative value would be
+        // nonsensical, so map it to None rather than wrap.
+        pid: pid.filter(|p| *p >= 0).map(|p| p as u32),
         workspace_id,
         state: WindowState {
             focused: Some(is_focused),

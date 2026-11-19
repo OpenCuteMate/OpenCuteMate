@@ -110,6 +110,11 @@ fn tiled_windows_have_no_geometry_and_floating_do() {
             "tiled window must have no geometry (niri reports none)"
         );
         assert_eq!(window.state.floating, Some(false));
+        // The pid flows through to the neutral model (Phase 3c added it
+        // for cross-provider parity with Win32).
+        if window.id == 7 {
+            assert_eq!(window.pid, Some(5027));
+        }
     }
 
     let events = provider.feed(WINDOW_OPENED_FLOATING);

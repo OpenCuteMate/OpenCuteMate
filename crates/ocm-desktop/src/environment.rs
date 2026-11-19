@@ -376,6 +376,7 @@ mod tests {
             id,
             title: None,
             app_id: None,
+            pid: None,
             workspace_id: None,
             state: WindowState::default(),
             geometry: Some(WindowGeometry {

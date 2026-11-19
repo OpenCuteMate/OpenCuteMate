@@ -151,6 +151,9 @@ pub struct WindowInfo {
     pub id: u64,
     pub title: Option<String>,
     pub app_id: Option<String>,
+    /// Process id that created the window, when the platform reports
+    /// it (Niri IPC and Win32 do).
+    pub pid: Option<u32>,
     /// Workspace the window is on (id into [`WorkspaceInfo`]), if known.
     pub workspace_id: Option<u64>,
     pub state: WindowState,
