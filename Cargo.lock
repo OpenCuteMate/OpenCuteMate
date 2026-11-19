@@ -2488,6 +2488,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocm-desktop-windows"
+version = "0.1.0"
+dependencies = [
+ "ocm-desktop",
+ "thiserror 2.0.21",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "ocm-platform"
 version = "0.1.0"
 dependencies = [

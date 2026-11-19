@@ -5,6 +5,7 @@ members = [
     "crates/ocm-character",
     "crates/ocm-desktop",
     "crates/ocm-desktop-niri",
+    "crates/ocm-desktop-windows",
     "crates/ocm-platform",
     "crates/ocm-platform-wayland",
     "crates/ocm-renderer",
@@ -51,6 +52,7 @@ ocm-core = { path = "crates/ocm-core" }
 ocm-character = { path = "crates/ocm-character" }
 ocm-desktop = { path = "crates/ocm-desktop" }
 ocm-desktop-niri = { path = "crates/ocm-desktop-niri" }
+ocm-desktop-windows = { path = "crates/ocm-desktop-windows" }
 ocm-platform = { path = "crates/ocm-platform" }
 ocm-platform-wayland = { path = "crates/ocm-platform-wayland" }
 ocm-renderer = { path = "crates/ocm-renderer" }

@@ -33,8 +33,12 @@ pub mod provider;
 pub use environment::DesktopEnvironment;
 pub use events::{EnvironmentChange, EnvironmentEvent};
 pub use layout::DesktopLayout;
+// The shared rectangle vocabulary (input regions, hitboxes, work areas)
+// comes from the platform crate and is re-exported so consumers of the
+// desktop model need no second dependency.
 pub use model::{
     DesktopCapabilities, DesktopSnapshot, OutputInfo, OutputPhysical, OutputTransform,
     WindowGeometry, WindowInfo, WindowState, WorkspaceInfo,
 };
+pub use ocm_platform::Rect;
 pub use provider::{DesktopProvider, ProviderError};

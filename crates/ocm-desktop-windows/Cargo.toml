@@ -1,0 +1,27 @@
+[package]
+name = "ocm-desktop-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ocm-desktop.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# Native Win32 APIs (type-verified by cross-checking against
+# x86_64-pc-windows-gnu; see tests/windows-crosscheck.sh). Windows-only:
+# the rest of the crate (the pure translation layer + its tests) builds
+# everywhere so `cargo test --workspace` stays green on Linux.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+] }
