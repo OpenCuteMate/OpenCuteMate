@@ -16,8 +16,15 @@
 #   6. Phase 3a character physics (second launch with --physics):
 #      spawn fall -> landing, drag toss with release velocity, bottom-
 #      strip pixel verification, settle + park, teardown
+#   7. Phase 3b desktop environment awareness (third launch with the
+#      niri IPC socket attached): snapshot acquisition, event delivery
+#      (windows open/float/focus/close, workspaces) through the
+#      persistent event-stream subscription, floating-window geometry
+#      pixel-verified against a compositor screenshot, graceful
+#      degradation without the IPC socket, idle CPU unchanged
 #
-# Requires: cargo, niri, python3+PIL, magick. No root, no uinput.
+# Requires: cargo, niri, python3+PIL, magick, kitty (awareness section).
+# No root, no uinput.
 #
 # usage: tests/niri.sh [--keep]           (keep the work dir for inspection)
 #        OCM_RENDERER=bevy tests/niri.sh  (run against the Bevy backend;
@@ -48,6 +55,8 @@ note() { printf '       %s\n' "$*"; }
 cleanup() {
   [ -n "${APP_PID:-}" ] && kill "$APP_PID" 2>/dev/null
   [ -n "${NESTED_PID:-}" ] && kill "$NESTED_PID" 2>/dev/null
+  [ -n "${PROBE_PID:-}" ] && kill "$PROBE_PID" 2>/dev/null
+  for pid in ${KITTY_PIDS:-}; do kill "$pid" 2>/dev/null; done
   if [ -n "${INJECT_PID:-}" ]; then
     exec 3>&- 2>/dev/null || true
     kill "$INJECT_PID" 2>/dev/null
@@ -315,7 +324,7 @@ done
 sleep 0.2
 inj up 0x110
 
-grep -q "drag started" "$APP_LOG" \
+wait_log "drag started" 15 \
   && ok "drag started (press inside hitbox)" \
   || bad "no drag start in app log"
 wait_log "drag ended" 15 \
@@ -420,7 +429,9 @@ done
 inj up 0x110
 LANDINGS=$(grep -c "character landed" "$APP_LOG" || true)
 # Poll until a SECOND landing appears (the toss fall + wall/slide settle).
-for _ in $(seq 1 80); do
+# The window is generous because a throttled compositor (host focus
+# stolen mid-run) delivers frame callbacks at ~0.5 Hz.
+for _ in $(seq 1 160); do
   LANDINGS2=$(grep -c "character landed" "$APP_LOG" || true)
   [ "${LANDINGS2:-0}" -gt "${LANDINGS:-0}" ] && break
   kill -0 "$APP_PID" 2>/dev/null || break
@@ -431,7 +442,7 @@ if [ "${LANDINGS2:-0}" -gt "${LANDINGS:-0}" ]; then
 else
   bad "toss produced no second landing"
 fi
-grep -q "drag started" "$APP_LOG" && grep -q "drag ended" "$APP_LOG" \
+wait_log "drag started" 15 && wait_log "drag ended" 15 \
   && ok "physics drag lifecycle logged" \
   || bad "physics drag lifecycle missing in log"
 
@@ -498,6 +509,241 @@ if [ "${TOSS_X:--1}" -ge 0 ]; then
 else
   kill "$APP_PID" 2>/dev/null
 fi
+
+# --- Phase 3b: desktop environment awareness (third launch) -------------------------
+say "desktop environment awareness (third launch with the niri IPC attached)"
+
+say "building the environment probe"
+cargo build -p ocm-desktop-niri --example env-probe 2>&1 | tail -1 || { bad "probe build failed"; exit 1; }
+PROBE="$REPO/target/debug/examples/env-probe"
+[ -x "$PROBE" ] || { bad "probe binary missing"; exit 1; }
+
+# Snapshot against the nested compositor: the probe's view of outputs
+# must match what the compositor itself reports.
+PROBE_OUT=$(NIRI_SOCKET="$IPCSOCK" "$PROBE" --once 2>&1 | head -1)
+NESTED_LOGICAL=$(NIRI_SOCKET="$IPCSOCK" niri msg --json outputs | python3 -c '
+import json,sys
+outs = json.load(sys.stdin)
+o = list(outs.values())[0]
+print(o["logical"]["width"], o["logical"]["height"])')
+if echo "$PROBE_OUT" | grep -q "logical=Some(($(echo "$NESTED_LOGICAL" | sed 's/ /, /')))"; then
+  ok "desktop snapshot matches the compositor state (niri IPC, $NESTED_LOGICAL logical)"
+else
+  bad "probe output mismatch: '$PROBE_OUT' vs nested logical ($NESTED_LOGICAL)"
+fi
+echo "$PROBE_OUT" | grep -q "work_area=None" \
+  && ok "work areas reported honestly unavailable (niri has none)" \
+  || bad "work area should be None on niri"
+
+# Persistent event-stream probe capturing everything for the checks below.
+NIRI_SOCKET="$IPCSOCK" "$PROBE" > "$WORK/probe-events.log" 2>&1 &
+PROBE_PID=$!
+sleep 1
+
+# Third launch: the app with awareness attached (NIRI_SOCKET is REQUIRED
+# here — unset it would silently point at the host compositor).
+APP_LOG="$WORK/app-aware.log"
+WAYLAND_DISPLAY="$WLSOCK" NIRI_SOCKET="$IPCSOCK" RUST_LOG="debug,naga=warn,wgpu=warn,bevy=warn,bevy_render=warn,bevy_pbr=warn,bevy_winit=warn" "$APP" \
+  --renderer "$OCM_RENDERER" --position 0.5,0.55 --size 0.4 --fps 60 > "$APP_LOG" 2>&1 &
+APP_PID=$!
+
+PARKED=0
+for _ in $(seq 1 200); do
+  if grep -q "rendering parked (idle)" "$APP_LOG"; then PARKED=1; break; fi
+  kill -0 "$APP_PID" 2>/dev/null || break
+  sleep 0.25
+done
+kill -0 "$APP_PID" 2>/dev/null || { bad "awareness app exited during startup"; cat "$APP_LOG"; exit 1; }
+[ "$PARKED" -eq 1 ] || { bad "awareness app never parked"; kill "$APP_PID"; exit 1; }
+ok "awareness app started and parked"
+
+grep -q "desktop environment snapshot acquired (niri IPC)" "$APP_LOG" \
+  && ok "desktop snapshot acquired by the runtime" \
+  || bad "no desktop snapshot in app log"
+grep -q "desktop awareness attached (niri event stream)" "$APP_LOG" \
+  && ok "persistent niri event stream attached" \
+  || bad "awareness not attached in app log"
+
+# --- idle CPU with awareness attached (must remain architectural zero) --------------
+say "idle CPU with desktop awareness attached (3 s window)"
+F1=$(grep -c "frame presented" "$APP_LOG" || true)
+U1=$(awk '{print $14+$15}' /proc/$APP_PID/stat 2>/dev/null)
+sleep 3
+U2=$(awk '{print $14+$15}' /proc/$APP_PID/stat 2>/dev/null)
+F2=$(grep -c "frame presented" "$APP_LOG" || true)
+CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
+IDLE_MS=$(( (U2-U1) * 1000 / CLK_TCK ))
+if [ "${F2:-0}" -gt "${F1:-0}" ] || [ "${U2:-1}" -gt "${U1:-0}" ]; then
+  bad "idle CPU ${IDLE_MS} ms / ${F2:-0} frames over 3 s with the provider attached (expected 0)"
+else
+  ok "idle CPU = 0 ticks over 3 s with the event stream attached (0 frames)"
+fi
+
+# --- window events through the subscription -----------------------------------------
+say "window lifecycle events (kitty opened/floated/focused/closed in the nested compositor)"
+KITTY_PIDS=""
+WAYLAND_DISPLAY="$WLSOCK" kitty > /dev/null 2>&1 &
+KITTY_PIDS="$!"
+for _ in $(seq 1 80); do
+  grep -q 'window-added' "$WORK/probe-events.log" && break
+  sleep 0.25
+done
+grep -q 'window-added id=' "$WORK/probe-events.log" \
+  && ok "window open event delivered (event stream, no polling)" \
+  || bad "no window-added event reached the probe"
+
+# Float it: niri then reports on-screen geometry (tiled windows get none).
+NIRI_SOCKET="$IPCSOCK" niri msg action toggle-window-floating >/dev/null 2>&1
+GEOMETRY=""
+for _ in $(seq 1 80); do
+  GEOMETRY=$(grep -oP 'window-changed id=\d+ app="kitty".*geometry=\K[0-9.,]+ [0-9x]+' "$WORK/probe-events.log" | tail -1)
+  [ -n "$GEOMETRY" ] && break
+  sleep 0.25
+done
+if [ -n "$GEOMETRY" ]; then
+  ok "floating window geometry reported: $GEOMETRY (output-local logical px)"
+  GEO_X=$(echo "$GEOMETRY" | cut -d, -f1)
+  GEO_Y=$(echo "$GEOMETRY" | cut -d, -f2 | cut -d' ' -f1)
+  GEO_W=$(echo "$GEOMETRY" | grep -oP '\d+(?=x)')
+  GEO_H=$(echo "$GEOMETRY" | grep -oP '(?<=x)\d+')
+else
+  bad "no geometry after floating the window (niri should report it)"
+  GEO_X=0; GEO_Y=0; GEO_W=0; GEO_H=0
+fi
+
+# Pixel-verify the reported geometry against a compositor screenshot.
+if [ -n "$GEOMETRY" ] && [ "$GEO_W" -gt 0 ] 2>/dev/null; then
+  rm -f "$WORK/screen.png"
+  NIRI_SOCKET="$IPCSOCK" niri msg action screenshot-screen
+  for _ in $(seq 1 40); do [ -s "$WORK/screen.png" ] && break; sleep 0.2; done
+  if [ -s "$WORK/screen.png" ] && python3 - "$WORK/screen.png" "$OUT_W" "$OUT_H" \
+      "$GEO_X" "$GEO_Y" "$GEO_W" "$GEO_H" <<'EOF'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert("RGB")
+iw, ih = img.size
+w, h = float(sys.argv[2]), float(sys.argv[3])
+sx, sy = iw / w, ih / h
+x, y, gw, gh = (float(v) for v in sys.argv[4:8])
+def px(x, y):
+    return img.getpixel((min(int(x * sx), iw - 1), min(int(y * sy), ih - 1)))
+def is_bg(c):
+    r, g, b = c
+    return abs(r - 255) < 60 and g < 60 and abs(b - 255) < 60  # magenta background
+cx, cy = x + gw / 2, y + gh / 2
+inside_ok = not is_bg(px(cx, cy))
+outside_ok = is_bg(px(x - 20, y + gh / 2)) or x - 20 < 0
+sys.exit(0 if (inside_ok and outside_ok) else 1)
+EOF
+  then
+    ok "window geometry pixel-verified (center inside the reported rect, just outside is background)"
+  else
+    bad "reported window geometry does not match the compositor screenshot"
+  fi
+fi
+
+# Window focus events: a second kitty opens focused (covered by its
+# WindowOpenedOrChanged record); niri emits WindowFocusChanged when an
+# EXISTING window regains focus — which happens when the second window
+# closes and focus returns to the first. So: spawn, close, then expect
+# the focus event.
+WAYLAND_DISPLAY="$WLSOCK" kitty > /dev/null 2>&1 &
+KITTY_PIDS="$KITTY_PIDS $!"
+for _ in $(seq 1 80); do
+  grep -q 'event window-focused' "$WORK/probe-events.log" && break
+  sleep 0.25
+done
+if grep -q 'event window-focused' "$WORK/probe-events.log"; then
+  ok "window focus events delivered"
+else
+  # Close the second window so focus returns to an existing one.
+  for pid in $KITTY_PIDS; do kill "$pid" 2>/dev/null; done
+  KITTY_PIDS=$(printf '%s ' $KITTY_PIDS | awk '{print $1}')  # keep kitty 1
+  for _ in $(seq 1 80); do
+    grep -q 'event window-focused' "$WORK/probe-events.log" && break
+    sleep 0.25
+  done
+  grep -q 'event window-focused' "$WORK/probe-events.log" \
+    && ok "window focus events delivered (focus returned after the second window closed)" \
+    || bad "no focus event reached the probe"
+fi
+
+# Workspace events: switch away and back.
+WS_EVENTS_BEFORE=$(grep -c 'event workspace' "$WORK/probe-events.log" || true)
+NIRI_SOCKET="$IPCSOCK" niri msg action focus-workspace-down >/dev/null 2>&1
+sleep 1
+NIRI_SOCKET="$IPCSOCK" niri msg action focus-workspace-up >/dev/null 2>&1
+sleep 1
+WS_EVENTS_AFTER=$(grep -c 'event workspace' "$WORK/probe-events.log" || true)
+if [ "${WS_EVENTS_AFTER:-0}" -gt "${WS_EVENTS_BEFORE:-0}" ]; then
+  ok "workspace change events delivered (focus-workspace switches)"
+else
+  bad "no workspace events after switching workspaces"
+fi
+
+# Close both kitties: removal events must arrive.
+for pid in $KITTY_PIDS; do kill "$pid" 2>/dev/null; done
+KITTY_PIDS=""
+REMOVALS_AFTER=0
+for _ in $(seq 1 80); do
+  REMOVALS_AFTER=$(grep -c 'event window-removed' "$WORK/probe-events.log" || true)
+  [ "${REMOVALS_AFTER:-0}" -ge 2 ] && break
+  sleep 0.25
+done
+if [ "${REMOVALS_AFTER:-0}" -ge 2 ]; then
+  ok "window close events delivered (both test windows)"
+else
+  bad "window removal events missing (${REMOVALS_AFTER:-0}/2)"
+fi
+
+# The runtime must have seen the window churn without rendering a frame
+# for it (environment updates are awareness, not scene changes).
+FRAMES_A=$(grep -c "frame presented" "$APP_LOG" || true)
+sleep 1
+FRAMES_B=$(grep -c "frame presented" "$APP_LOG" || true)
+if [ "${FRAMES_A:-0}" -eq "${FRAMES_B:-0}" ]; then
+  ok "window churn scheduled no frames (environment events are not scene changes)"
+else
+  bad "window churn triggered renders (${FRAMES_A} -> ${FRAMES_B})"
+fi
+
+kill "$PROBE_PID" 2>/dev/null
+
+# Quit the awareness app via right-click.
+inj move "$CUBE_A_X" "$CUBE_A_Y" "$OUT_W" "$OUT_H"
+sleep 0.4
+inj click 0x111
+EXIT_CODE=-1
+for _ in $(seq 1 40); do
+  kill -0 "$APP_PID" 2>/dev/null || { wait "$APP_PID"; EXIT_CODE=$?; break; }
+  sleep 0.2
+done
+if [ "$EXIT_CODE" -eq 0 ]; then
+  ok "awareness app exited cleanly via right-click (exit 0)"
+else
+  kill "$APP_PID" 2>/dev/null
+  bad "awareness app did not quit on right-click (exit=$EXIT_CODE)"
+fi
+
+# --- graceful degradation without the compositor IPC --------------------------------
+say "runtime behavior when the compositor IPC is unavailable (fourth launch)"
+APP_LOG="$WORK/app-nodefault.log"
+WAYLAND_DISPLAY="$WLSOCK" NIRI_SOCKET="/nonexistent/ocm-test.sock" RUST_LOG="info" "$APP" \
+  --renderer "$OCM_RENDERER" --position 0.5,0.55 > "$APP_LOG" 2>&1 &
+APP_PID=$!
+PARKED=0
+for _ in $(seq 1 200); do
+  if grep -q "rendering parked (idle)" "$APP_LOG"; then PARKED=1; break; fi
+  kill -0 "$APP_PID" 2>/dev/null || break
+  sleep 0.25
+done
+if [ "$PARKED" -eq 1 ] && grep -q "desktop awareness unavailable" "$APP_LOG"; then
+  ok "dead IPC socket: app logs the absence, keeps running, parks (Phase 3a behavior)"
+else
+  bad "app did not degrade gracefully without the compositor IPC"
+  kill "$APP_PID" 2>/dev/null
+fi
+kill "$APP_PID" 2>/dev/null
 
 # --- idle measurement #2: post-quit proof from the parked window --------------------
 say "summary: PASS=$PASS FAIL=$FAIL"
