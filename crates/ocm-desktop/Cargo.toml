@@ -1,0 +1,13 @@
+[package]
+name = "ocm-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# For the neutral `Rect` type: work areas share the same rectangle
+# vocabulary as input regions and hitboxes.
+ocm-platform.workspace = true
+thiserror.workspace = true
