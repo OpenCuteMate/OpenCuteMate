@@ -164,6 +164,7 @@ impl DesktopProvider for WindowsProvider {
 }
 
 /// Bridge the API-layer error into the neutral provider error.
+#[cfg(windows)]
 fn api_error(error: api::ApiError) -> ProviderError {
     match error {
         api::ApiError::Call(m) => ProviderError::Protocol(m),
