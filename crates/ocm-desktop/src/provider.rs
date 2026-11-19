@@ -1,22 +1,24 @@
-//! The [`DesktopProvider`] contract: how a compositor backend supplies
+//! The [`DesktopProvider`] contract: how a platform backend supplies
 //! desktop environment data to the neutral core.
 //!
-//! A provider owns its connection to the compositor (IPC socket, Wayland
-//! protocol objects, helper process — its choice) and translates what it
-//! learns into the neutral [`crate::model`] types and
-//! [`crate::events::EnvironmentEvent`]s. Compositor-specific structures
-//! must never cross this boundary.
+//! A provider owns its connection to the environment (Niri's IPC socket,
+//! Win32 event hooks, Wayland protocol objects — its choice) and
+//! translates what it learns into the neutral [`crate::model`] types and
+//! [`crate::events::EnvironmentEvent`]s. Platform-specific structures
+//! must never cross this boundary; the trait itself is platform-neutral
+//! (no file descriptors, sockets or OS types in its signature), so the
+//! same consumer code runs against any provider.
 //!
 //! Two delivery styles are supported, declared via
 //! [`DesktopCapabilities`]:
 //!
 //! - **push** (`event_stream: true`): the provider holds a persistent
-//!   subscription; [`DesktopProvider::poll_events`] non-blockingly drains
-//!   it. Event loops register [`DesktopProvider::watch_fd`].
+//!   subscription (socket, hook, ...); [`DesktopProvider::poll_events`]
+//!   non-blockingly drains it. Event-loop integration is the provider
+//!   crate's business (see `ocm-desktop-niri::NiriSource` for the
+//!   calloop shape).
 //! - **pull**: the consumer re-invokes the relevant fetches on its own
 //!   schedule (document the interval and why polling is required).
-
-use std::os::fd::RawFd;
 
 use crate::events::EnvironmentEvent;
 use crate::model::{DesktopCapabilities, DesktopSnapshot, OutputInfo};
@@ -39,9 +41,9 @@ pub enum ProviderError {
     Protocol(String),
 }
 
-/// A compositor backend for desktop environment awareness.
+/// A platform backend for desktop environment awareness.
 pub trait DesktopProvider {
-    /// Provider identity (e.g. `"niri-ipc"`).
+    /// Provider identity (e.g. `"niri-ipc"`, `"win32"`).
     fn name(&self) -> &'static str;
 
     /// What this provider can actually supply. Must be truthful: the
@@ -55,10 +57,6 @@ pub trait DesktopProvider {
     /// Only meaningful for providers with `event_stream`; may return
     /// [`ProviderError::Unsupported`] otherwise.
     fn poll_events(&mut self) -> Result<Vec<EnvironmentEvent>, ProviderError>;
-
-    /// The read end to register with an event loop, if the provider
-    /// pushes events. `None` = consumers must poll.
-    fn watch_fd(&self) -> Option<RawFd>;
 
     /// Re-fetch the output set. For providers whose push stream does not
     /// cover output changes (the consumer schedules this; see

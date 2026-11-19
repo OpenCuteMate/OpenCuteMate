@@ -39,7 +39,6 @@ mod ipc;
 mod source;
 
 use std::collections::BTreeMap;
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use ocm_desktop::{
@@ -264,10 +263,6 @@ impl DesktopProvider for NiriProvider {
         Ok(events)
     }
 
-    fn watch_fd(&self) -> Option<RawFd> {
-        Some(self.stream.as_raw_fd())
-    }
-
     fn refresh_outputs(&mut self) -> Result<Vec<OutputInfo>, ProviderError> {
         Self::fetch_outputs(Some(&self.socket))
     }
@@ -297,7 +292,12 @@ pub fn niri_capabilities() -> DesktopCapabilities {
         // but no positions.
         window_geometry: true,
         window_geometry_all: false,
-        window_state_flags: false,
+        // Visibility is derivable (workspace activeness) but not directly
+        // reported; left None.
+        window_visibility: false,
+        // The IPC has no minimized/maximized/fullscreen fields at all.
+        window_min_max_state: false,
+        window_fullscreen_state: false,
 
         workspaces: true,
         workspace_events: true,

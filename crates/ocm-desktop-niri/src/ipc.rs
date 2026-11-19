@@ -8,7 +8,6 @@
 //! stream of JSON event lines.
 
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -85,10 +84,6 @@ impl IpcConnection {
     /// Switch to non-blocking mode (event-stream polling).
     pub fn set_nonblocking(&self) -> std::io::Result<()> {
         self.stream.set_nonblocking(true)
-    }
-
-    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.stream.as_raw_fd()
     }
 
     /// Read whatever is available right now into the given line buffer

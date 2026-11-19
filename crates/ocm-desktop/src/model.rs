@@ -124,7 +124,7 @@ impl WindowGeometry {
     }
 }
 
-/// The state flags of one window. `None` = the compositor does not
+/// The state flags of one window. `None` = the platform does not
 /// report this property (there is no honest default).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowState {
@@ -136,6 +136,9 @@ pub struct WindowState {
     /// meaningful for compositors with both tiling and floating layouts;
     /// `None` for plain floating WMs.
     pub floating: Option<bool>,
+    /// Whether the window is currently visible/shown. `None` when the
+    /// platform does not report visibility directly.
+    pub visible: Option<bool>,
     pub urgent: Option<bool>,
 }
 
@@ -226,8 +229,12 @@ pub struct DesktopCapabilities {
     /// Geometry is available for *every* window (not just e.g. floating
     /// or visible ones).
     pub window_geometry_all: bool,
-    /// Minimized/maximized/fullscreen flags.
-    pub window_state_flags: bool,
+    /// Direct visibility reporting (`WindowState::visible`).
+    pub window_visibility: bool,
+    /// Minimized/maximized flags.
+    pub window_min_max_state: bool,
+    /// Fullscreen state (only when reliably detectable, not guessed).
+    pub window_fullscreen_state: bool,
 
     // --- workspaces / delivery ----------------------------------------------
     pub workspaces: bool,

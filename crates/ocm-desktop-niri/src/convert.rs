@@ -228,11 +228,14 @@ pub fn window_to_info(window: NiriWindow) -> WindowInfo {
         state: WindowState {
             focused: Some(is_focused),
             // Not exposed by the IPC (checked niri-ipc 26.04): never
-            // guessed here.
+            // guessed here. Visibility would be derivable from the
+            // workspace activeness, but niri does not report it
+            // directly — left None like the flags above.
             minimized: None,
             maximized: None,
             fullscreen: None,
             floating: Some(is_floating),
+            visible: None,
             urgent: Some(is_urgent),
         },
         geometry: geometry_from_layout(&layout),
