@@ -20,12 +20,23 @@ use clap::{ArgAction, Parser};
 use ocm_character::{Character, DesktopBounds, ElementHitbox, InteractionEvent, InteractionSystem};
 use ocm_core::logging;
 use ocm_core::{Config, Layer, PlatformError};
+use ocm_desktop::{DesktopEnvironment, DesktopProvider, EnvironmentChange, EnvironmentEvent};
+use ocm_desktop_niri::{NiriProvider, NiriSource};
 use ocm_platform::{OverlaySurface, Platform, PlatformEvent, Rect};
 use ocm_platform_wayland::WaylandPlatform;
 use ocm_renderer::{FrameOutcome, RenderOpts, Renderer, SceneState};
 
 /// Seconds of inactivity before the character falls asleep.
 const SLEEP_AFTER: Duration = Duration::from_secs(60);
+
+/// How often the runtime re-polls the compositor's output set.
+///
+/// The Niri event stream covers windows and workspaces but not outputs
+/// (no output event exists in the niri 26.04 IPC), so outputs are the
+/// one environmental family that needs polling. Each poll is a single
+/// IPC socket connect (~50 µs of work, no process spawn); the interval
+/// only trades output-change latency against wakeups.
+const OUTPUT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Frame pacing / scheduler state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +62,23 @@ enum InputRegion {
     FullSurface,
 }
 
+/// The desktop-awareness side of the app: the neutral environment state
+/// fed by a provider (Niri IPC today) plus the loop tokens it owns.
+///
+/// Everything here is additive — with awareness disabled or the provider
+/// unavailable, the runtime behaves exactly as in Phase 3a.
+struct DesktopState {
+    environment: DesktopEnvironment,
+    /// Output the character lives on (the platform's target output).
+    target_output: String,
+    /// Event-source token (to remove on `ProviderLost`).
+    source: Option<RegistrationToken>,
+    /// Output re-poll timer (providers without output events need it).
+    output_refresh: Option<RegistrationToken>,
+    /// One-shot window-overlap report dedup (count, under).
+    last_window_report: (usize, usize),
+}
+
 struct App {
     overlay: ocm_platform_wayland::WaylandOverlay,
     renderer: Box<dyn Renderer>,
@@ -74,6 +102,9 @@ struct App {
     frames: u64,
     idle_logged: bool,
     loop_handle: LoopHandle<'static, App>,
+    /// Desktop environment awareness (optional; `None` = disabled or
+    /// provider unavailable).
+    desktop: Option<DesktopState>,
 }
 
 impl App {
@@ -396,6 +427,180 @@ impl App {
         }
         self.maybe_render();
     }
+
+    // --- desktop environment awareness ------------------------------------
+
+    /// Feed one environmental event into the environment and react to
+    /// what actually changed. Window and workspace updates never touch
+    /// the scheduler; only a real change to the character's output
+    /// geometry can affect the character (and through it, rendering).
+    fn on_environment_event(&mut self, event: EnvironmentEvent) {
+        let Some(desktop) = self.desktop.as_mut() else {
+            return;
+        };
+        let change = desktop.environment.apply(event);
+        self.on_environment_change(change);
+    }
+
+    fn on_environment_change(&mut self, change: EnvironmentChange) {
+        if change.provider_lost {
+            self.on_provider_lost();
+        }
+        if change.outputs_changed {
+            self.sync_bounds_with_environment();
+        }
+        if change.windows_changed {
+            self.report_windows_near_character();
+        }
+        if change.workspaces_changed || change.focus_changed {
+            tracing::debug!(?change, "desktop environment updated");
+        }
+    }
+
+    /// The provider's subscription died: drop its loop sources and keep
+    /// the last known environment (marked stale by the loss itself).
+    fn on_provider_lost(&mut self) {
+        let Some(desktop) = self.desktop.as_mut() else {
+            return;
+        };
+        tracing::warn!("desktop environment provider lost; awareness paused (state kept)");
+        if let Some(token) = desktop.source.take() {
+            self.loop_handle.remove(token);
+        }
+        if let Some(token) = desktop.output_refresh.take() {
+            self.loop_handle.remove(token);
+        }
+    }
+
+    /// Reconcile the character's bounds with the environment's view of
+    /// its output: the work area when the compositor reports one, the
+    /// reported logical output otherwise. The layer-shell configure
+    /// (Phase 2 behavior) stays authoritative for the surface itself;
+    /// this only ever moves the character when the *work area* differs
+    /// from what the surface configure said.
+    fn sync_bounds_with_environment(&mut self) {
+        let Some(desktop) = self.desktop.as_ref() else {
+            return;
+        };
+        let env = &desktop.environment;
+        let Some(output) = env.output(&desktop.target_output) else {
+            return; // not known yet; the configure remains in charge
+        };
+        if let Some((w, h)) = output.logical_size {
+            let (ow, oh) = self.overlay.logical_size();
+            if (w, h) != (ow, oh) {
+                tracing::debug!(
+                    ipc = ?(w, h),
+                    surface = ?(ow, oh),
+                    "IPC output size differs from the surface configure"
+                );
+            }
+        }
+        let bounds = match output.work_area {
+            Some(area) => DesktopBounds::new(area.width.max(1) as u32, area.height.max(1) as u32),
+            None => match output.logical_size {
+                Some((w, h)) => DesktopBounds::new(w.max(1), h.max(1)),
+                None => return,
+            },
+        };
+        if bounds != self.bounds {
+            tracing::info!(
+                output = %desktop.target_output,
+                bounds = ?(bounds.width, bounds.height),
+                "character bounds updated from the environment"
+            );
+            self.bounds = bounds;
+            let outcome = self.character.set_bounds(bounds);
+            self.dirty = true;
+            self.apply_input_region();
+            self.apply_mode(outcome);
+            self.maybe_render();
+        }
+    }
+
+    /// What the environment currently knows about windows around the
+    /// character. This is the Phase 3b *integration boundary* for future
+    /// window interactions: geometry is only reported for windows whose
+    /// compositor provides it (niri: floating windows), and a report is
+    /// logged only when the counts change — environmental events never
+    /// schedule frames for this.
+    fn report_windows_near_character(&mut self) {
+        let Some(desktop) = self.desktop.as_ref() else {
+            return;
+        };
+        let windows = desktop
+            .environment
+            .windows_on_output(&desktop.target_output);
+        if windows.is_empty() {
+            return;
+        }
+        let (width, height) = self.overlay.logical_size();
+        let position = self.character.position();
+        let anchor = (position.0 * width as f64, position.1 * height as f64);
+        let under = windows
+            .iter()
+            .filter(|(_, geometry)| geometry.contains(anchor))
+            .count();
+        let report = (windows.len(), under);
+        if report == desktop.last_window_report {
+            return; // unchanged; no log spam while windows jiggle
+        }
+        let target = desktop.target_output.clone();
+        if let Some(desktop) = self.desktop.as_mut() {
+            desktop.last_window_report = report;
+        }
+        tracing::info!(
+            output = %target,
+            count = report.0,
+            under_character = report.1,
+            "windows near the character (geometry as reported by the compositor)"
+        );
+    }
+
+    /// Schedule the output re-poll (the one environmental family the
+    /// event stream does not cover). One-shot timers re-armed from their
+    /// own callback keep the pattern used elsewhere in the runtime.
+    fn arm_output_refresh(&mut self) {
+        let Some(desktop) = self.desktop.as_mut() else {
+            return;
+        };
+        if desktop.output_refresh.is_some() {
+            return;
+        }
+        match self.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(OUTPUT_REFRESH_INTERVAL),
+            |_, _, app| {
+                app.refresh_outputs();
+                calloop::timer::TimeoutAction::Drop // refresh_outputs re-arms
+            },
+        ) {
+            Ok(token) => {
+                if let Some(desktop) = self.desktop.as_mut() {
+                    desktop.output_refresh = Some(token);
+                }
+            }
+            Err(e) => tracing::error!("failed to schedule the output re-poll: {e}"),
+        }
+    }
+
+    fn refresh_outputs(&mut self) {
+        let Some(desktop) = self.desktop.as_mut() else {
+            return;
+        };
+        // The timer consumed itself (Drop action); it re-arms below.
+        desktop.output_refresh = None;
+        let change = match NiriProvider::fetch_outputs(None) {
+            Ok(list) => desktop
+                .environment
+                .apply(EnvironmentEvent::OutputsChanged(list)),
+            Err(e) => {
+                tracing::warn!("output re-poll failed: {e}");
+                desktop.environment.apply(EnvironmentEvent::ProviderLost)
+            }
+        };
+        self.arm_output_refresh();
+        self.on_environment_change(change);
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -470,6 +675,11 @@ struct Args {
     /// Rendering backend: "wgpu" (default) or "bevy".
     #[arg(long, value_name = "NAME")]
     renderer: Option<String>,
+
+    /// Disable desktop environment awareness (default: on when a Niri
+    /// IPC socket is available).
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_desktop: bool,
 }
 
 fn main() -> ExitCode {
@@ -710,7 +920,63 @@ fn main() -> ExitCode {
         frames: 0,
         idle_logged: false,
         loop_handle: handle.clone(),
+        desktop: None,
     };
+
+    // ---- Desktop environment awareness (optional) ------------------------------
+    // Additive by design: without a provider the runtime is exactly the
+    // validated Phase 3a app. The provider feeds snapshots and events;
+    // none of them schedule rendering on their own — only a real change
+    // to the character's output geometry can touch the character.
+    if !args.no_desktop {
+        match NiriProvider::connect(None) {
+            Ok(mut provider) => {
+                let mut environment = DesktopEnvironment::new(provider.capabilities());
+                match provider.snapshot() {
+                    Ok(snapshot) => {
+                        tracing::info!(
+                            outputs = snapshot.outputs.len(),
+                            windows = snapshot.windows.len(),
+                            workspaces = snapshot.workspaces.len(),
+                            "desktop environment snapshot acquired (niri IPC)"
+                        );
+                        // The first snapshot establishes the environment;
+                        // nothing is scheduled from it (bounds come from
+                        // the layer-shell configure until they differ).
+                        let _ = environment.apply(EnvironmentEvent::Snapshot(snapshot));
+                    }
+                    Err(e) => tracing::warn!("desktop snapshot failed: {e}"),
+                }
+                match NiriSource::new(provider) {
+                    Ok(source) => {
+                        match handle.insert_source(source, |event: EnvironmentEvent, _, app| {
+                            app.on_environment_event(event);
+                        }) {
+                            Ok(token) => {
+                                let target = overlay.target_output().unwrap_or_default();
+                                app.desktop = Some(DesktopState {
+                                    environment,
+                                    target_output: target,
+                                    source: Some(token),
+                                    output_refresh: None,
+                                    last_window_report: (0, 0),
+                                });
+                                app.arm_output_refresh();
+                                tracing::info!("desktop awareness attached (niri event stream)");
+                            }
+                            Err(e) => tracing::warn!("failed to register the niri source: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to prepare the niri event source: {e}"),
+                }
+            }
+            Err(e) => {
+                tracing::info!("desktop awareness unavailable ({e}); continuing without it");
+            }
+        }
+    } else {
+        tracing::info!("desktop awareness disabled (--no-desktop)");
+    }
 
     // Input region for the initial placement + first render.
     app.apply_input_region();

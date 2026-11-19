@@ -2534,6 +2534,8 @@ dependencies = [
  "clap",
  "ocm-character",
  "ocm-core",
+ "ocm-desktop",
+ "ocm-desktop-niri",
  "ocm-platform",
  "ocm-platform-wayland",
  "ocm-renderer",

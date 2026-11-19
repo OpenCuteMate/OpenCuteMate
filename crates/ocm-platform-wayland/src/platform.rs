@@ -148,6 +148,7 @@ impl Platform for WaylandPlatform {
             s.layer_surface = Some(layer_surface);
             s.viewport = viewport;
             s.fractional = fractional;
+            s.target_output = Some(output.monitor.name.clone());
         }
 
         // Initial commit: tells the compositor we are done with initial

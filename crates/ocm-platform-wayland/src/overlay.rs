@@ -24,6 +24,14 @@ pub struct WaylandOverlay {
     pub(crate) shared: Rc<RefCell<Shared>>,
 }
 
+impl WaylandOverlay {
+    /// The name of the output this overlay lives on (the same id the
+    /// desktop environment providers key on).
+    pub fn target_output(&self) -> Option<String> {
+        self.shared.borrow().target_output.clone()
+    }
+}
+
 impl OverlaySurface for WaylandOverlay {
     fn native_handles(&self) -> NativeHandles {
         let s = self.shared.borrow();

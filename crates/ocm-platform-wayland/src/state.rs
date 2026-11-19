@@ -65,6 +65,9 @@ pub(crate) struct Shared {
 
     /// Logical size from the layer-shell configure.
     pub logical_size: Option<(u32, u32)>,
+    /// Name of the output this overlay was created on (IPC/wayland
+    /// output name, e.g. "eDP-1"); desktop awareness keys on it.
+    pub target_output: Option<String>,
     /// The compositor closed the layer surface.
     pub closed: bool,
     /// Preferred scale in 1/120 units from `wp_fractional_scale_v1`
@@ -97,6 +100,7 @@ impl Shared {
             viewport: None,
             fractional: None,
             logical_size: None,
+            target_output: None,
             closed: false,
             frac_scale: None,
             output_scale: 1,

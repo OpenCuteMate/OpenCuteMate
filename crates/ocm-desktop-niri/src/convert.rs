@@ -57,9 +57,10 @@ pub struct NiriLogicalOutput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum NiriTransform {
-    // Wire names exactly as niri-ipc serializes them: un-renamed unit
-    // variants keep their Rust names ("Normal", "Flipped"); the rest
-    // carry explicit renames.
+    // Wire names exactly as niri-ipc serializes them: only the numeric
+    // variants carry serde renames; everything else serializes as its
+    // Rust variant name (verified against both a host output "Normal"
+    // and a nested output "Flipped180").
     Normal,
     #[serde(rename = "90")]
     Rotate90,
@@ -68,11 +69,8 @@ pub enum NiriTransform {
     #[serde(rename = "270")]
     Rotate270,
     Flipped,
-    #[serde(rename = "flipped-90")]
     Flipped90,
-    #[serde(rename = "flipped-180")]
     Flipped180,
-    #[serde(rename = "flipped-270")]
     Flipped270,
 }
 
