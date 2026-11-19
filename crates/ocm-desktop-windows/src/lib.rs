@@ -51,7 +51,7 @@
 
 mod api;
 #[cfg(test)]
-mod monitors;
+mod fixtures;
 mod translate;
 
 use ocm_desktop::{
@@ -172,25 +172,39 @@ fn api_error(error: api::ApiError) -> ProviderError {
 }
 
 mod provider {
-    //! cfg(windows) provider state. Grows in Phase 3c commits: monitor
-    //! snapshot first, then window enumeration, then the event hook.
+    //! cfg(windows) provider state: monitor + window snapshot, the
+    //! event hook thread, and the raw-event → neutral-event mapping.
 
     #![cfg(windows)]
 
     use std::collections::BTreeMap;
+    use std::sync::mpsc;
 
     use super::api_error;
     use ocm_desktop::{DesktopSnapshot, EnvironmentEvent, OutputInfo, ProviderError, WindowInfo};
 
     use crate::{api, translate};
 
+    /// Monitor re-enumeration tick, riding the event pump. Windows has
+    /// no push notification for monitor changes available to a plain
+    /// client; polling here is required and documented (see
+    /// docs/desktop-awareness.md §6). Monitor changes are rare events;
+    /// one enumeration (~0.1 ms) per tick is negligible.
+    const MONITOR_TICK_MS: u32 = 10_000;
+
+    /// Events buffered between polls. Sized for window-drag storms
+    /// (location-change events fire per frame); a slow consumer drops
+    /// overflow (logged once by the hook thread), never blocks it.
+    const EVENT_CHANNEL_BOUND: usize = 4096;
+
     pub struct State {
-        /// Last known window records (seeded by the snapshot, patched
-        /// by events later): the event path needs full records and
-        /// removal detection.
+        /// Last known window records: the event path needs full
+        /// records, addition detection and removal detection.
         windows: BTreeMap<u64, WindowInfo>,
         /// Per-pid executable names (queried once per process).
         exe_cache: api::ExeCache,
+        events: mpsc::Receiver<api::RawEvent>,
+        hook: Option<api::HookHandle>,
     }
 
     impl State {
@@ -202,9 +216,18 @@ mod provider {
                 return Err(ProviderError::Unavailable);
             }
             tracing::debug!(monitors = monitors.len(), "win32 monitor discovery ok");
+
+            let (sender, events) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+            // A failed hook setup surfaces here: connect fails, the
+            // caller treats awareness as unavailable (never fatal).
+            let hook = api::start_event_thread(sender, MONITOR_TICK_MS).map_err(api_error)?;
+            tracing::debug!("win32 event hook running");
+
             Ok(Self {
                 windows: BTreeMap::new(),
                 exe_cache: BTreeMap::new(),
+                events,
+                hook: Some(hook),
             })
         }
 
@@ -224,16 +247,91 @@ mod provider {
         }
 
         pub fn poll_events(&mut self) -> Result<Vec<EnvironmentEvent>, ProviderError> {
-            // The event hook lands in the tracking commit; until then
-            // this provider reports no pushed events (its capabilities
-            // say event_stream only once tracking exists).
-            Ok(Vec::new())
+            // Drain the raw events, coalescing per-window actions so a
+            // drag storm costs one re-query per window per poll.
+            let mut refresh: Vec<u64> = Vec::new();
+            let mut removed: Vec<u64> = Vec::new();
+            let mut focus: Option<u64> = None;
+            let mut monitor_refresh = false;
+
+            while let Ok(raw) = self.events.try_recv() {
+                match translate::map_win_event(&raw) {
+                    translate::EventAction::Ignore => {}
+                    translate::EventAction::RefreshWindow => refresh.push(raw.hwnd),
+                    translate::EventAction::WindowRemoved => removed.push(raw.hwnd),
+                    translate::EventAction::Focused => focus = Some(raw.hwnd),
+                    translate::EventAction::MonitorRefresh => monitor_refresh = true,
+                }
+            }
+
+            let mut events: Vec<EnvironmentEvent> = Vec::new();
+
+            if monitor_refresh {
+                let outputs = translate::monitors_to_info(&api::monitors().map_err(api_error)?);
+                events.push(EnvironmentEvent::OutputsChanged(outputs));
+            }
+            // Removals first, so a destroyed window cannot be
+            // resurrected by a queued create in the same batch.
+            for hwnd in &removed {
+                events.extend(self.apply_removal(*hwnd));
+            }
+            refresh.sort_unstable();
+            refresh.dedup();
+            for hwnd in refresh {
+                if removed.contains(&hwnd) {
+                    continue;
+                }
+                events.extend(self.apply_refresh(hwnd));
+            }
+            if let Some(hwnd) = focus {
+                events.push(EnvironmentEvent::WindowFocused {
+                    id: (hwnd != 0).then_some(hwnd),
+                });
+            }
+            Ok(events)
         }
 
         pub fn refresh_outputs(&mut self) -> Result<Vec<OutputInfo>, ProviderError> {
             Ok(translate::monitors_to_info(
                 &api::monitors().map_err(api_error)?,
             ))
+        }
+
+        /// A window destroyed per the hook: report removal when we knew
+        /// it, nothing otherwise (the environment ignores removals of
+        /// windows it never had).
+        fn apply_removal(&mut self, hwnd: u64) -> Option<EnvironmentEvent> {
+            if self.windows.remove(&hwnd).is_some() {
+                Some(EnvironmentEvent::WindowRemoved { id: hwnd })
+            } else {
+                None
+            }
+        }
+
+        /// Re-query one window and emit the right event: added,
+        /// changed, or (when it no longer passes the filter, e.g. it
+        /// was hidden or cloaked) removed.
+        fn apply_refresh(&mut self, hwnd: u64) -> Option<EnvironmentEvent> {
+            let raw = api::query_window(hwnd, &mut self.exe_cache).ok()??;
+            let info = translate::window_to_info(&raw)?;
+            let known = self.windows.contains_key(&info.id);
+            self.windows.insert(info.id, info.clone());
+            Some(if known {
+                EnvironmentEvent::WindowChanged(info)
+            } else {
+                EnvironmentEvent::WindowAdded(info)
+            })
+        }
+    }
+
+    impl Drop for State {
+        fn drop(&mut self) {
+            // Hook thread teardown: unhook, kill timer, join. A lost
+            // thread (panic) logs but must not panic the dropper.
+            if let Some(hook) = self.hook.take() {
+                hook.stop();
+                tracing::debug!("win32 event hook stopped");
+            }
         }
     }
 }

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::mem;
 
 use windows::core::{BOOL, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -29,7 +29,8 @@ use windows::Win32::Graphics::Gdi::{
     HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -37,8 +38,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE,
-    WS_EX_TOOLWINDOW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    KillTimer, PostThreadMessageW, SetTimer, GWL_EXSTYLE, WM_QUIT, WM_TIMER, WS_EX_TOOLWINDOW,
 };
 
 use crate::translate::{Orientation, RawMonitor, RawWindow};
@@ -208,18 +209,33 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // No unwraps here: this runs inside a system callback. Any window
     // that fails a query is skipped, never defaulted.
     let data = &mut *(lparam.0 as *mut WindowEnumData);
+    match collect_window(hwnd, data.exe_cache, data.foreground) {
+        Some(raw) => data.out.push(raw),
+        None => {}
+    }
+    true.into()
+}
 
-    if !IsWindowVisible(hwnd).as_bool() {
-        return true.into();
+/// Query one window (used by the enumerator and by event-triggered
+/// refreshes). Returns `None` for windows that fail `IsWindow`, are
+/// invisible, cloaked or tool windows — the same filter as
+/// enumeration, so event refreshes and snapshots agree.
+unsafe fn collect_window(
+    hwnd: HWND,
+    exe_cache: &mut ExeCache,
+    foreground: HWND,
+) -> Option<RawWindow> {
+    if !IsWindow(Some(hwnd)).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+        return None;
     }
     // Suspended UWP apps are alive but not rendered.
     if cloaked_state(hwnd) != 0 {
-        return true.into();
+        return None;
     }
     // Palettes/toolbars the shell itself excludes from task switching.
     let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if (ex_style & WS_EX_TOOLWINDOW.0 as isize) != 0 {
-        return true.into();
+        return None;
     }
 
     let title = window_text(hwnd, GetWindowTextLengthW(hwnd));
@@ -233,7 +249,7 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     let exe = if pid != 0 {
-        data.exe_cache
+        exe_cache
             .entry(pid)
             .or_insert_with(|| process_image(pid))
             .clone()
@@ -241,7 +257,7 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         None
     };
 
-    data.out.push(RawWindow {
+    Some(RawWindow {
         hwnd: hwnd.0 as u64,
         title,
         exe,
@@ -250,12 +266,23 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         visible: true,
         minimized,
         maximized,
-        foreground: hwnd == data.foreground,
+        foreground: hwnd == foreground,
         cloaked: false,
         tool_window: false,
         monitor_dpi,
-    });
-    true.into()
+    })
+}
+
+/// Query a single window for an event-triggered refresh. `exe_cache`
+/// must be the provider's cache so names stay consistent.
+pub(crate) fn query_window(
+    hwnd: u64,
+    exe_cache: &mut ExeCache,
+) -> Result<Option<RawWindow>, ApiError> {
+    with_thread_dpi(|| {
+        let foreground = unsafe { GetForegroundWindow() };
+        Ok(unsafe { collect_window(HWND(hwnd as *mut core::ffi::c_void), exe_cache, foreground) })
+    })
 }
 
 /// DWMWA_CLOAKED != 0 (0 when DWM or the attribute are unavailable).
@@ -291,7 +318,7 @@ fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
     let mut rect = RECT::default();
     // Failure leaves the default (all-zero) rect; callers downstream
     // filter degenerate geometry out.
-    unsafe { GetWindowRect(hwnd, &mut rect) };
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
     rect_tuple(rect)
 }
 
@@ -340,4 +367,184 @@ fn process_image(pid: u32) -> Option<String> {
     let stem = path.rsplit(['\\', '/']).next().unwrap_or(&path);
     let stem = stem.strip_suffix(".exe").unwrap_or(stem);
     Some(stem.to_ascii_lowercase())
+}
+
+// ---------------------------------------------------------------------------
+// Event tracking: hook thread + message pump
+// ---------------------------------------------------------------------------
+
+/// One raw hook event forwarded to the provider.
+pub(crate) type RawEvent = crate::translate::RawWinEvent;
+
+/// Handle to the running hook thread.
+pub(crate) struct HookHandle {
+    /// The pump thread's id, so teardown can post `WM_QUIT` to it.
+    thread_id: u32,
+    /// Join handle for a clean shutdown.
+    join: std::thread::JoinHandle<()>,
+}
+
+impl HookHandle {
+    /// Ask the pump thread to exit (unhook + kill timer + join).
+    pub fn stop(self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        let _ = self.join.join();
+    }
+}
+
+/// Start the event-hook thread.
+///
+/// Win32 delivers `SetWinEventHook` callbacks on the thread that
+/// installed the hook, and only while that thread pumps messages — so
+/// the hook lives on a dedicated thread running a `GetMessageW` pump.
+/// The same pump receives `WM_TIMER` (the monitor re-enumeration
+/// tick), so no extra polling thread exists.
+///
+/// Events are forwarded over a bounded channel; the callback drops
+/// (and counts, logged once) events when a slow consumer lets it fill.
+/// Returns only after the pump thread reports its id and a successfully
+/// installed hook — a hook failure surfaces as an error from connect.
+///
+/// `monitor_tick_ms` is the monitor re-enumeration interval.
+pub(crate) fn start_event_thread(
+    sender: std::sync::mpsc::SyncSender<RawEvent>,
+    monitor_tick_ms: u32,
+) -> Result<HookHandle, ApiError> {
+    // The pump reports its thread id (and the hook outcome) over a
+    // one-shot channel; a timeout bounds a stuck thread.
+    let (id_tx, id_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let join = std::thread::Builder::new()
+        .name("ocm-desktop-win-events".into())
+        .spawn(move || unsafe { pump(sender, monitor_tick_ms, id_tx) })
+        .map_err(|e| ApiError::Call(format!("event thread spawn: {e}")))?;
+
+    match id_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(thread_id)) => Ok(HookHandle { thread_id, join }),
+        Ok(Err(reason)) => {
+            let _ = join.join();
+            Err(ApiError::Call(reason))
+        }
+        Err(e) => {
+            let _ = join.join();
+            Err(ApiError::Call(format!("event thread startup: {e}")))
+        }
+    }
+}
+
+thread_local! {
+    /// The pump thread's own sink. Win32 delivers the hook's callbacks
+    /// on this thread only, so a thread-local is the correct (and
+    /// lock-free) way for the callback to reach it.
+    static SENDER: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<RawEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Total events dropped when the bounded channel was full.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe extern "system" fn win_event_proc(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    // Callback contract: never panic, never block for long. Filtering
+    // to OBJID_WINDOW happens here — that is the highest-volume noise:
+    // child objects of every control in every app.
+    if id_object != crate::translate::win_events::OBJID_WINDOW || hwnd.0.is_null() {
+        return;
+    }
+    let raw = RawEvent {
+        code: event,
+        hwnd: hwnd.0 as u64,
+        object: id_object,
+    };
+    let sent = SENDER.with(|sink| sink.borrow().as_ref().map(|s| s.try_send(raw).is_ok()));
+    if sent == Some(false) {
+        let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dropped == 0 {
+            tracing::warn!("event channel full; dropping desktop events until it drains");
+        }
+    }
+}
+
+unsafe fn pump(
+    sender: std::sync::mpsc::SyncSender<RawEvent>,
+    monitor_tick_ms: u32,
+    ready: std::sync::mpsc::Sender<Result<u32, String>>,
+) {
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, TranslateMessage, MSG, WINEVENT_OUTOFCONTEXT,
+    };
+
+    // The thread-local sink must exist before the hook can fire.
+    SENDER.with(|sink| *sink.borrow_mut() = Some(sender));
+    let thread_id = GetCurrentThreadId();
+
+    // One hook over both event families we consume (system 0x0003.. and
+    // object 0x8000..): unknown codes are mapped to Ignore downstream.
+    let hook = SetWinEventHook(
+        crate::translate::win_events::EVENT_SYSTEM_FOREGROUND,
+        crate::translate::win_events::EVENT_OBJECT_LOCATIONCHANGE,
+        None,
+        Some(win_event_proc),
+        0,
+        thread_id,
+        WINEVENT_OUTOFCONTEXT,
+    );
+    if hook.is_invalid() {
+        // Close the sink first so the provider's next poll sees the
+        // loss, then report the failure to the starter.
+        SENDER.with(|sink| sink.borrow_mut().take());
+        let _ = ready.send(Err("SetWinEventHook failed".into()));
+        return;
+    }
+    if ready.send(Ok(thread_id)).is_err() {
+        // The starter gave up (or was dropped): tear down immediately.
+        let _ = UnhookWinEvent(hook);
+        return;
+    }
+    let _ = ready;
+
+    // The monitor re-enumeration tick rides the same pump.
+    let timer = SetTimer(None, 0, monitor_tick_ms, None);
+
+    let mut msg = MSG::default();
+    loop {
+        // 0 = WM_QUIT, -1 = pump error; anything else is a message.
+        let r = GetMessageW(&mut msg, None, 0, 0);
+        if r.0 == 0 || r.0 == -1 {
+            if r.0 == -1 {
+                tracing::error!("event pump error; Windows event tracking stopped");
+            }
+            break;
+        }
+        if msg.message == WM_TIMER {
+            let sentinel = RawEvent {
+                // Cannot collide with a real WinEvent.
+                code: crate::translate::PUMP_MONITOR_REFRESH,
+                hwnd: 0,
+                object: crate::translate::win_events::OBJID_WINDOW,
+            };
+            if SENDER.with(|sink| sink.borrow().as_ref().map(|s| s.try_send(sentinel).is_ok()))
+                == Some(false)
+            {
+                let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if dropped == 0 {
+                    tracing::warn!("event channel full; monitor refresh dropped");
+                }
+            }
+        }
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    let _ = KillTimer(None, timer);
+    let _ = UnhookWinEvent(hook);
 }

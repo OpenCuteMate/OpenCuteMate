@@ -266,3 +266,90 @@ pub fn window_to_info(raw: &RawWindow) -> Option<WindowInfo> {
         geometry,
     })
 }
+
+// ---------------------------------------------------------------------------
+// WinEvent translation
+// ---------------------------------------------------------------------------
+
+// `SetWinEventHook` event constants (stable, documented Win32 values,
+// mirrored so the mapping is fixture-testable on every OS).
+pub mod win_events {
+    pub const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+    pub const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+    pub const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+    pub const EVENT_OBJECT_CREATE: u32 = 0x8000;
+    pub const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+    pub const EVENT_OBJECT_SHOW: u32 = 0x8002;
+    pub const EVENT_OBJECT_HIDE: u32 = 0x8003;
+    pub const EVENT_OBJECT_STATECHANGE: u32 = 0x800A;
+    pub const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+    /// `OBJID_WINDOW` (idObject value identifying the window itself).
+    pub const OBJID_WINDOW: i32 = 0;
+}
+
+/// Sentinel event code sent by the provider's own pump (never a real
+/// WinEvent): the monitor re-enumeration tick.
+pub const PUMP_MONITOR_REFRESH: u32 = u32::MAX;
+
+/// One raw WinEvent as delivered by the hook callback.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawWinEvent {
+    pub code: u32,
+    pub hwnd: u64,
+    /// `idObject` from the callback (only `OBJID_WINDOW` events are
+    /// forwarded by the API layer).
+    pub object: i32,
+}
+
+/// What the provider must do for one raw WinEvent. The expensive work
+/// (re-querying a window) happens once per window per poll batch, not
+/// per event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EventAction {
+    /// Known but irrelevant (system events, child-object events,
+    /// future event codes).
+    Ignore,
+    /// Re-query this window: it may have appeared, moved, resized,
+    /// changed state or become filtered.
+    RefreshWindow,
+    /// The window is gone.
+    WindowRemoved,
+    /// The window gained foreground focus.
+    Focused,
+    /// Re-enumerate monitors (monitor configuration may have changed).
+    MonitorRefresh,
+}
+
+/// Map one raw WinEvent to an action.
+///
+/// Coverage: create/destroy/show/hide/location/state/minimize events
+/// and foreground focus. Deliberately ignored: `EVENT_OBJECT_REORDER`
+/// (z-order is not modeled), `EVENT_OBJECT_FOCUS` per-element focus
+/// noise (the coarser `EVENT_SYSTEM_FOREGROUND` is the focus source),
+/// and anything unknown (forward compatibility).
+pub fn map_win_event(event: &RawWinEvent) -> EventAction {
+    use win_events::*;
+    // The provider pump's own sentinel (never a real WinEvent) is not
+    // tied to a window.
+    if event.code == PUMP_MONITOR_REFRESH {
+        return EventAction::MonitorRefresh;
+    }
+    if event.object != OBJID_WINDOW {
+        return EventAction::Ignore;
+    }
+    if event.hwnd == 0 {
+        return EventAction::Ignore;
+    }
+    match event.code {
+        EVENT_OBJECT_CREATE
+        | EVENT_OBJECT_SHOW
+        | EVENT_OBJECT_HIDE
+        | EVENT_OBJECT_LOCATIONCHANGE
+        | EVENT_OBJECT_STATECHANGE
+        | EVENT_SYSTEM_MINIMIZESTART
+        | EVENT_SYSTEM_MINIMIZEEND => EventAction::RefreshWindow,
+        EVENT_OBJECT_DESTROY => EventAction::WindowRemoved,
+        EVENT_SYSTEM_FOREGROUND => EventAction::Focused,
+        _ => EventAction::Ignore,
+    }
+}
