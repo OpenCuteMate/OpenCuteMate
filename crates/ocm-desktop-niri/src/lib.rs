@@ -31,6 +31,14 @@
 //! Unknown event-stream variants are skipped (niri adds variants across
 //! releases); a parse failure never takes the consumer down — the source
 //! reports [`EnvironmentEvent::ProviderLost`] instead.
+//!
+//! Platform: the transport is a Unix socket, so this provider is
+//! Unix-only by nature (`cfg(unix)`). The Windows provider lives in
+//! `ocm-desktop-windows`; the shared `ocm-desktop` model is where they
+//! meet. Nothing here can regress Windows builds because nothing here
+//! compiles there.
+
+#![cfg(unix)]
 
 mod convert;
 #[cfg(test)]
