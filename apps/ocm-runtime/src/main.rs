@@ -20,8 +20,11 @@ use clap::{ArgAction, Parser};
 use ocm_character::{Character, DesktopBounds, ElementHitbox, InteractionEvent, InteractionSystem};
 use ocm_core::logging;
 use ocm_core::{Config, Layer, PlatformError};
-use ocm_desktop::{DesktopEnvironment, DesktopProvider, EnvironmentChange, EnvironmentEvent};
-use ocm_desktop_niri::{NiriProvider, NiriSource};
+use ocm_desktop::{DesktopEnvironment, EnvironmentChange, EnvironmentEvent};
+use ocm_desktop_niri::NiriProvider;
+
+mod desktop;
+use desktop as desktop_seam;
 use ocm_platform::{OverlaySurface, Platform, PlatformEvent, Rect};
 use ocm_platform_wayland::WaylandPlatform;
 use ocm_renderer::{FrameOutcome, RenderOpts, Renderer, SceneState};
@@ -924,59 +927,8 @@ fn main() -> ExitCode {
     };
 
     // ---- Desktop environment awareness (optional) ------------------------------
-    // Additive by design: without a provider the runtime is exactly the
-    // validated Phase 3a app. The provider feeds snapshots and events;
-    // none of them schedule rendering on their own — only a real change
-    // to the character's output geometry can touch the character.
-    if !args.no_desktop {
-        match NiriProvider::connect(None) {
-            Ok(mut provider) => {
-                let mut environment = DesktopEnvironment::new(provider.capabilities());
-                match provider.snapshot() {
-                    Ok(snapshot) => {
-                        tracing::info!(
-                            outputs = snapshot.outputs.len(),
-                            windows = snapshot.windows.len(),
-                            workspaces = snapshot.workspaces.len(),
-                            "desktop environment snapshot acquired (niri IPC)"
-                        );
-                        // The first snapshot establishes the environment;
-                        // nothing is scheduled from it (bounds come from
-                        // the layer-shell configure until they differ).
-                        let _ = environment.apply(EnvironmentEvent::Snapshot(snapshot));
-                    }
-                    Err(e) => tracing::warn!("desktop snapshot failed: {e}"),
-                }
-                match NiriSource::new(provider) {
-                    Ok(source) => {
-                        match handle.insert_source(source, |event: EnvironmentEvent, _, app| {
-                            app.on_environment_event(event);
-                        }) {
-                            Ok(token) => {
-                                let target = overlay.target_output().unwrap_or_default();
-                                app.desktop = Some(DesktopState {
-                                    environment,
-                                    target_output: target,
-                                    source: Some(token),
-                                    output_refresh: None,
-                                    last_window_report: (0, 0),
-                                });
-                                app.arm_output_refresh();
-                                tracing::info!("desktop awareness attached (niri event stream)");
-                            }
-                            Err(e) => tracing::warn!("failed to register the niri source: {e}"),
-                        }
-                    }
-                    Err(e) => tracing::warn!("failed to prepare the niri event source: {e}"),
-                }
-            }
-            Err(e) => {
-                tracing::info!("desktop awareness unavailable ({e}); continuing without it");
-            }
-        }
-    } else {
-        tracing::info!("desktop awareness disabled (--no-desktop)");
-    }
+    // Platform seam: apps/ocm-runtime/src/desktop.rs (niri on Linux).
+    desktop_seam::attach(&mut app, &handle, &overlay, args.no_desktop);
 
     // Input region for the initial placement + first render.
     app.apply_input_region();
