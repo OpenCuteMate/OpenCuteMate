@@ -4,12 +4,20 @@ An open-source desktop companion (in the spirit of Desktop Mate) — animated
 characters that live on your desktop.
 
 **Status: Phases 1, 2, 2b and 3a complete; Phase 3b implemented — the
-character now has desktop environment awareness: a compositor-neutral
-model of the desktop it lives in (outputs with per-output scales and
+character has desktop environment awareness: a platform-neutral model
+of the desktop it lives in (outputs with per-output scales and
 transforms, work areas, windows with honest capability reporting,
-workspaces), fed by a Niri IPC provider over a persistent event stream,
-with region-based multi-display coordinate math and an event-driven
-runtime integration that never wakes the idle character.**
+workspaces), with multi-display coordinate math and an event-driven
+runtime integration that never wakes the idle character. Phase 3c
+extended awareness across platforms: the same neutral model is fed by
+the Niri IPC provider on Linux and by a native Win32 provider on
+Windows (monitor discovery with real work areas, window enumeration
+with DWM visible-bounds geometry, WinEvent-driven tracking). The
+Windows provider is type-checked cross-platform and fixture-tested,
+and awaits runtime validation on real Windows hardware via the
+`win-probe` diagnostic; the character app itself is not
+Windows-hostable yet — that porting surface is documented in
+`docs/desktop-awareness.md` §10.**
 
 Phase 2 proved the core architectural assumption:
 
@@ -34,8 +42,8 @@ Phase 3a builds the character system on top:
   floor; opt-in via `--physics`), and the animation seam
   (`AnimatedPose`) that future glTF clips and VRM expressions plug
   into.
-- **`ocm-desktop`** + **`ocm-desktop-niri`** (Phase 3b, new crates): the
-  environmental foundation. `ocm-desktop` is pure and compositor-neutral
+- **`ocm-desktop`** + providers (Phases 3b/3c, new crates): the
+  environmental foundation. `ocm-desktop` is pure and platform-neutral
   (outputs, work areas, windows, workspaces, capability reports,
   environmental events, the `DesktopEnvironment` accumulator, and the
   region-based `DesktopLayout` for multi-display coordinate math —
@@ -43,9 +51,17 @@ Phase 3a builds the character system on top:
   implements the provider over Niri's JSON IPC socket directly (no
   subprocesses): full state up-front, then windows/workspaces/focus
   events pushed; outputs re-polled cheaply (the event stream has no
-  output events). Everything the compositor can't provide (Niri: work
-  areas, primary output, minimized/maximized/fullscreen flags, tiled
-  window positions) is reported as unavailable, never faked.
+  output events). **`ocm-desktop-windows`** (Phase 3c) feeds the same
+  model from native Win32: `EnumDisplayMonitors`/`GetMonitorInfoW` with
+  real work areas and primary detection, `EnumWindows` with DWM
+  visible-bounds geometry, and `SetWinEventHook` tracking on its own
+  message-pump thread — no subprocesses. Everything a platform can't
+  provide (Niri: work areas, primary output, minimized/maximized/
+  fullscreen flags, tiled window positions; Windows: fullscreen state,
+  virtual desktops for foreign windows) is reported as unavailable,
+  never faked. The Windows provider is type-checked cross-platform
+  (`tests/windows-crosscheck.sh`) and awaits runtime validation on real
+  Windows hardware (`win-probe`).
 - Both renderers draw arbitrary element/part models and compute
   per-element hitboxes from the same camera math — the single source
   of truth for what is where on screen.
@@ -80,14 +96,18 @@ crates/ocm-core              config (TOML), errors, logging
 crates/ocm-character        model elements, state machine, interaction,
                              physics, animation (pure, Phase 3a)
 crates/ocm-desktop          neutral desktop environment model, layout
-                             math, provider contract (Phase 3b)
+                             math, provider contract (Phases 3b/3c)
 crates/ocm-desktop-niri     Niri IPC desktop provider + calloop source
                              (Phase 3b)
+crates/ocm-desktop-windows  native Win32 desktop provider + win-probe
+                             diagnostic (Phase 3c; runtime-validated on
+                             Windows separately — see desktop-awareness.md)
 crates/ocm-platform          platform-neutral traits, events, raw-handle bridge
 crates/ocm-platform-wayland  layer-shell, input, outputs, fractional scale, calloop source
 crates/ocm-renderer          wgpu 30 backend + Bevy 0.20 backend (shared placement math)
 apps/ocm-runtime             CLI + main loop + scheduler + input-region policy + teardown
 tests/niri.sh                automated validation suite (nested Niri, both backends)
+tests/windows-crosscheck.sh  type-checks all Windows-targeted code on Linux
 tests/perf.sh                repeatable renderer performance comparison
 tests/hyprland.sh            the same suite against Hyprland
 docs/                        research + results (all claims labeled Verified/Assumption/Unresolved)

@@ -1,21 +1,25 @@
-# Desktop Environment Awareness (Phase 3b)
+# Desktop Environment Awareness (Phases 3b + 3c)
 
-**Document status:** Phase 3b design + implementation document.
-**Verification date:** 2026-11-19. Every capability claim is labeled:
+**Document status:** Phase 3b (Niri) + Phase 3c (Windows) design and
+implementation document.
+**Verification dates:** 2026-11-19 (Niri), 2026-11-20 (Windows code,
+**not runtime-validated on Windows** — see §8/§11). Every capability
+claim is labeled:
 
 - **[Verified — Niri]** — exercised against the live Niri 26.04 compositor
   (dev session or the automated suite).
 - **[Verified — source]** — confirmed in compositor source/docs, not yet
   exercised here at runtime.
-- **[Implemented]** — exists in this codebase, generic (not
-  compositor-provided).
+- **[Implemented]** — exists in this codebase; for Windows rows it means
+  type-checked cross-platform + fixture-tested, **not yet executed on a
+  Windows session**.
 - **[Planned]** — designed for, not yet built.
-- **[Unavailable]** — the compositor cannot provide it; never faked.
+- **[Unavailable]** — the platform cannot provide it; never faked.
 
-The phase's product is the environmental foundation: a compositor-neutral
-model of the desktop the character lives in, a provider that feeds it
-from Niri's IPC, and a runtime integration that consumes it without
-waking the character or the renderer.
+The phase's product is the environmental foundation: a platform-neutral
+model of the desktop the character lives in, providers that feed it
+from Niri's IPC and from native Win32, and a runtime integration that
+consumes it without waking the character or the renderer.
 
 ---
 
@@ -26,6 +30,7 @@ waking the character or the renderer.
 │ ocm-runtime                                                        │
 │  DesktopState: DesktopEnvironment + provider tokens                │
 │  bounds reconciliation · window-overlap reports · output re-poll   │
+│  platform seam: apps/ocm-runtime/src/desktop.rs                    │
 └──────▲──────────────────────────────────────▲──────────────────────┘
        │ EnvironmentEvent (neutral)           │ DesktopBounds
        │                                      │ (output-local, unchanged)
@@ -38,27 +43,44 @@ waking the character or the renderer.
 ┌──────┴───────────────────┐
 │ Niri 26.04               │
 └──────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│ any consumer (win-probe today; a future Windows runtime)           │
+│  WindowsProvider: snapshot + event-driven poll                     │
+└──────▲─────────────────────────────────────────────────────────────┘
+       │ EnvironmentEvent (the same neutral vocabulary)
+┌──────┴───────────────────┐
+│ ocm-desktop-windows      │
+│ translate (pure) + api   │
+│ (cfg(windows) Win32)     │
+└──────▲───────────────────┘
+       │ EnumWindows / EnumDisplayMonitors / DWM / SetWinEventHook
+┌──────┴───────────────────┐
+│ Windows 10/11            │
+└──────────────────────────┘
 ```
 
 New crates:
 
 | Crate | Owns | Depends on | Never touches |
 |---|---|---|---|
-| `ocm-desktop` | The neutral model (`model`), event vocabulary (`events`), the state accumulator `DesktopEnvironment`, the region-based `DesktopLayout`, the `DesktopProvider` contract | `ocm-platform` (the `Rect` type) | any compositor, protocol, renderer |
+| `ocm-desktop` | The neutral model (`model`), event vocabulary (`events`), the state accumulator `DesktopEnvironment`, the region-based `DesktopLayout`, the `DesktopProvider` contract | `ocm-platform` (the `Rect` type) | any compositor, protocol, renderer, OS |
 | `ocm-desktop-niri` | The Niri IPC client (`ipc`), wire-format mirrors + conversion (`convert`), `NiriProvider`, the calloop `NiriSource` | `ocm-desktop`, `serde`/`serde_json`, `calloop` | rendering, character behavior |
+| `ocm-desktop-windows` | The pure translation layer (`translate`: raw observations → neutral model, fixture-tested everywhere), the cfg(windows) Win32 API layer (`api`), `WindowsProvider` | `ocm-desktop` (+ `windows` on Windows targets) | rendering, character behavior |
 
 Design rules:
 
-- **Compositor specifics stay in the provider crate.** `ocm-desktop`
+- **Platform specifics stay in the provider crates.** `ocm-desktop`
   speaks in generic outputs/windows/workspaces/capabilities; nothing
-  niri-shaped crosses the boundary. The runtime consumes the neutral
-  vocabulary only (it names `NiriProvider` for construction, exactly
-  like it names `WaylandPlatform`).
-- **Truthfulness.** Information the compositor does not expose is
+  niri- or Win32-shaped crosses the boundary. The trait is
+  transport-neutral (no file descriptors, sockets or OS types), so the
+  same consumer code runs against any provider. The runtime consumes
+  the neutral vocabulary only.
+- **Truthfulness.** Information the platform does not expose is
   `None` / a `false` capability — never a guess. See §8.
 - **The character stays pure.** `ocm-character` still knows only
   `DesktopBounds` (its output's logical frame). Multi-output movement is
-  a future phase (§9); the environment is ready for it, the character
+  a future phase (§12); the environment is ready for it, the character
   physics are not claimed to be.
 
 ## 2. What already existed vs what was added
@@ -115,6 +137,13 @@ Rules:
 - Per-output scales differ freely; a 1536×864 logical output at 1.25×
   (the dev machine) converts exactly to 1920×1080 physical — tested
   against the dev machine's actual numbers.
+- **Windows has no global logical space of its own**: its virtual-screen
+  coordinates are physical. The Windows provider therefore converts
+  (physical ÷ per-monitor scale, exact) so every provider feeds the
+  same global-logical model — Niri native, Windows converted. Mixed-DPI
+  monitor arrangements are fixture-tested; the straddling-window
+  approximation and the integer work-area rounding are documented in
+  §9.2.
 
 Unit test coverage (`ocm-desktop/src/layout.rs`): single-output
 roundtrip exactness, negative positions, side-by-side edge split,
@@ -128,17 +157,24 @@ excluded from spatial math, corner clamping.
 Per output, the neutral model carries (all optional):
 
 - stable id (`"eDP-1"` — the same name on the Wayland side and in the
-  Niri IPC; **[Verified — Niri]** both report `eDP-1`),
+  Niri IPC; **[Verified — Niri]** both report `eDP-1`; Windows uses the
+  device name `\\.\DISPLAYN` **[Implemented]**),
 - logical position/size **[Verified — Niri]** (matches `niri msg
   outputs` in the suite), scale (fractional, e.g. 1.25) **[Verified —
   Niri]**, transform (the wire uses `"Normal"`, `"90"`…,
   `"Flipped180"` — verified on both a host output and a nested output)
-  **[Verified — Niri]**,
+  **[Verified — Niri]**; **[Implemented on Windows]** with the DPI/96
+  scale and the clockwise→counter-clockwise orientation inversion
+  (direction pending validation on rotated hardware),
 - physical mode (resolution + refresh mHz) **[Verified — Niri]**,
+  **[Implemented on Windows]** (`EnumDisplaySettingsW`),
 - work area — **[Unavailable on Niri]**: niri's IPC exposes neither
   reserved areas nor a primary-output concept. Consumers must treat the
   full logical output as usable, which is what the runtime does.
-- primary — **[Unavailable on Niri]**.
+  **[Implemented on Windows]**: `rcWork` gives the taskbar-reserved
+  region directly; the runtime already prefers it over the full output.
+- primary — **[Unavailable on Niri]**; **[Implemented on Windows]**
+  (`MONITORINFOF_PRIMARY`).
 
 Multi-output: the model and layout fully support it (unit-tested);
 Niri runtime coverage is single-output on the dev machine — the nested
@@ -158,6 +194,10 @@ output-change latency against wakeups, and the scheduler owns it (the
 timer is removed on `ProviderLost`).
 
 ## 5. Windows
+
+*Windows-side window semantics are in §9; this section is the Niri
+findings plus what the neutral model therefore carries for both
+providers.*
 
 What the Niri IPC gives per window **[Verified — Niri]**: id, title,
 app id, pid, workspace id, focused / floating / urgent flags, sizes
@@ -181,11 +221,15 @@ Verified facts that shape the model:
 - **Workspace view == the output's logical area** (floating positions
   map 1:1 onto output-local logical coordinates; suite pixel check).
 
-The neutral `WindowInfo` therefore carries: id, title, app id,
-workspace id, a `WindowState` of `Option<bool>` flags (focused/floating/
-urgent filled by Niri; minimized/maximized/fullscreen unavailable), and
-`geometry: Option<WindowGeometry>` (global logical, fractional, tile
-rect including compositor decorations for Niri).
+The neutral `WindowInfo` therefore carries: id, title, app id, pid,
+workspace id, a `WindowState` of `Option<bool>` flags (Niri fills
+focused/floating/urgent; Windows fills focused/minimized/maximized/
+visible; minimized/maximized/fullscreen are unavailable on Niri and
+fullscreen unavailable on Windows), and
+`geometry: Option<WindowGeometry>` (global logical, fractional; Niri:
+the tile rect incl. decorations, floating windows only; Windows: the
+DWM visible bounds). `pid` was added in Phase 3c for cross-provider
+parity (Niri already reported it).
 
 Future interactions (walking on windows, sitting on edges, reacting to
 a window moving underneath) are *prepared*, not implemented: the
@@ -259,29 +303,175 @@ cache is provider-internal; the environment never sees niri types.
 
 ## 8. Capability matrix
 
-| Capability | Status | Evidence |
-|---|---|---|
-| Neutral environment model (outputs/windows/workspaces/events/capabilities) | **Implemented** | `ocm-desktop`, 21 unit tests |
-| Region-based desktop layout (multi-output, gaps, negatives, scales) | **Implemented** | `DesktopLayout`, 10 unit tests |
-| Niri provider (IPC socket, event stream, snapshot, re-poll) | **Implemented**, **Verified — Niri** | suite + live tests |
-| Output enumeration + logical geometry | **Verified — Niri** | suite: probe == `niri msg outputs` |
-| Output scale (fractional) | **Verified — Niri** | 1.25 live; suite |
-| Output transform | **Verified — Niri** | host `Normal`, nested `Flipped180` both parsed |
-| Physical mode + refresh | **Verified — Niri** | 1920×1080@144.003 live |
-| Work areas | **Unavailable (Niri)** / **Implemented (model)** | suite asserts `work_area=None`; Hyprland-style providers planned |
-| Primary output | **Unavailable (Niri)** | no such concept in niri IPC |
-| Output change events | **Unavailable (Niri)** / **Implemented (model + re-poll)** | niri-ipc source + live: no output events |
-| Window enumeration, identity, workspace, focus | **Verified — Niri** | suite + live |
-| Window geometry | **Partial — Verified — Niri**: floating windows only, pixel-accurate | suite pixel check; niri source |
-| Minimized/maximized/fullscreen | **Unavailable (Niri)** / **Implemented (model)** | niri-ipc source: no fields |
-| Window focus/layout/urgency events | **Verified — Niri** (focus, layouts; urgency not represented in the neutral model yet — **Planned**) | suite |
-| Workspace events (activation, active window) | **Verified — Niri** | suite |
-| Provider capability reporting | **Implemented** | `niri_capabilities()`, asserted by tests |
-| Graceful degradation without the compositor API | **Verified — Niri** (dead socket) | suite |
-| Hyprland provider | **Planned** (no claims) | blocked upstream since Phase 2 (§4 of compositor-compatibility.md) |
-| Window-based character behavior (surfing, collision) | **Planned** (data only) | §5, §9 |
+Cross-platform view (labels: **Verified** = executed against the real
+platform; **Implemented** = code exists, **not yet executed on that
+platform**; **Unavailable** = the platform cannot provide it):
 
-## 9. Multi-output movement (investigated, not implemented)
+| Capability | Niri 26.04 | Windows 10/11 |
+|---|---|---|
+| Output discovery | Verified | Implemented, pending Windows validation |
+| Output geometry (position/size) | Verified | Implemented (physical ÷ scale, exact) |
+| Per-output scale | Verified (fractional 1.25) | Implemented (DPI/96; mixed-DPI fixture-tested) |
+| Output mode + refresh | Verified | Implemented (`EnumDisplaySettingsW`) |
+| Output transform/orientation | Verified | Implemented — direction convention pending validation on rotated hardware |
+| Work areas | **Unavailable** (no IPC) | **Implemented** (`rcWork`: taskbar-reserved regions) |
+| Primary output | **Unavailable** (no concept) | **Implemented** (`MONITORINFOF_PRIMARY`) |
+| Output change events | **Unavailable** (no output events; 30 s re-poll) | **Unavailable** (no plain-client push; 10 s pump tick) |
+| Window enumeration | Verified | Implemented (`EnumWindows`, documented filter) |
+| Window geometry | Verified — floating windows only, pixel-accurate | Implemented — DWM extended frame bounds (visible window), `GetWindowRect` fallback; minimized = none |
+| Window state (minimized/maximized) | **Unavailable** (no IPC fields) | Implemented (`IsIconic`/`IsZoomed`) |
+| Window state (fullscreen) | **Unavailable** | **Unavailable** (rect-vs-monitor would be a heuristic — refused) |
+| Window visibility | **Unavailable** (not directly reported) | Implemented (`IsWindowVisible`) |
+| App identity | Verified (app_id) | Implemented (lowercased exe file stem; elevated processes = None) |
+| Process id | Verified | Implemented (`GetWindowThreadProcessId`) |
+| Window focus | Verified | Implemented (`GetForegroundWindow` + `EVENT_SYSTEM_FOREGROUND`) |
+| Window events (open/close/move/state) | Verified (event stream) | Implemented (`SetWinEventHook`, coalesced re-queries) |
+| Workspaces / virtual desktops | Verified (niri-native workspaces) | **Unavailable** — no documented API for foreign windows (§9.5) |
+| Provider capability reporting | Verified | Implemented (asserted in fixtures) |
+| Graceful degradation / teardown | Verified (dead socket, suite) | Implemented by construction (hook lifecycle; requires Windows validation) |
+
+## 9. The Windows provider (Phase 3c)
+
+`ocm-desktop-windows` implements the same neutral contract with native
+Win32 APIs — no subprocesses, no PowerShell. The crate splits into a
+**pure translation layer** (`translate.rs`: plain-data structs +
+conversion functions, fixture-tested on every OS) and a **cfg(windows)
+API layer** (`api.rs`: the Win32 calls that fill the raw structs). The
+Windows build is type-checked on every Linux run
+(`tests/windows-crosscheck.sh`, x86_64-pc-windows-gnu); **executing it
+is the user's manual step** — nothing in this document claims Windows
+runtime validation.
+
+### 9.1 APIs used
+
+| Data | API |
+|---|---|
+| Monitors, rects, work areas, primary | `EnumDisplayMonitors`, `GetMonitorInfoW` |
+| Mode: resolution, refresh, orientation | `EnumDisplaySettingsW` (via the monitor's device name) |
+| Per-monitor DPI | `GetDpiForMonitor` (`MDT_EFFECTIVE_DPI`; 96 fallback) |
+| Windows, titles, states | `EnumWindows`, `IsWindowVisible`, `IsIconic`, `IsZoomed`, `GetWindowTextW`, `GetWindowLongPtrW` |
+| Visible window bounds | `DwmGetWindowAttribute` (`DWMWA_EXTENDED_FRAME_BOUNDS`), `GetWindowRect` fallback |
+| Cloaking (suspended UWP) | `DwmGetWindowAttribute` (`DWMWA_CLOAKED`) |
+| Process identity | `GetWindowThreadProcessId`, `OpenProcess` + `QueryFullProcessImageNameW` (per-pid cached) |
+| Focus | `GetForegroundWindow`, `EVENT_SYSTEM_FOREGROUND` |
+| Change events | `SetWinEventHook` / `UnhookWinEvent` (`WINEVENT_OUTOFCONTEXT`) |
+| Pump + monitor tick | `GetMessageW` / `TranslateMessage` / `DispatchMessageW`, `SetTimer`/`KillTimer`, `PostThreadMessageW` (`WM_QUIT`) |
+
+All geometry reads run under a per-thread
+`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` context (set and restored)
+so rects are true physical pixels regardless of process DPI
+virtualization.
+
+### 9.2 Geometry semantics
+
+`WindowInfo.geometry` is the **visible window rectangle**: DWM extended
+frame bounds when available (excludes the invisible resize borders that
+`GetWindowRect` includes), falling back to `GetWindowRect`. Minimized
+windows report `geometry: None` (Win32 parks them at −32000 — not an
+on-screen position, so none is claimed). Conversion to the neutral
+global-logical space divides by the window's monitor scale (exact);
+a window straddling two monitors with different scales converts with
+the scale of `MonitorFromWindow`'s pick — the same approximation
+Wayland mixed-DPI makes, documented.
+
+### 9.3 Window filtering
+
+Excluded, exactly and fixture-tested:
+
+- **invisible** (`IsWindowVisible` covers the parent chain) — not on
+  screen;
+- **cloaked** (`DWMWA_CLOAKED`) — suspended UWP apps that are alive
+  per Win32 but not rendered;
+- **tool windows** (`WS_EX_TOOLWINDOW`) — palettes/toolbars the shell
+  itself excludes from task switching.
+
+Everything else `EnumWindows` reports is kept (owned dialogs, console
+windows, browser popups included). Untitled-but-visible windows stay in
+the model with `title: None`. No over-filtering of legitimate
+applications.
+
+### 9.4 Event tracking shape
+
+One hook over both consumed event families (system 0x0003.. and object
+0x8000..) on a dedicated thread running a `GetMessageW` pump — the
+shape Win32 requires (callbacks are delivered to the hook thread and
+only while it pumps). Child-object traffic (`idObject != OBJID_WINDOW`,
+the bulk of WinEvent volume) is filtered at the callback. Raw events
+flow over a bounded channel (4096); overflow drops and counts, logged
+once, never blocking the hook thread. The same pump owns a `SetTimer`
+tick (10 s) for monitor re-enumeration — Windows has no monitor-change
+push for plain clients, so this is the documented required poll. The
+provider maps raw events to **coalesced actions** (one re-query per
+window per poll; removals before refreshes), keeping a window cache
+for add/change/remove detection — the same shape as the Niri
+provider.
+
+Startup handshake: the pump reports its thread id and the hook
+outcome; a failed hook surfaces as a connect error (awareness
+unavailable, never fatal). Teardown posts `WM_QUIT`, unhooks, kills
+the timer and joins. Hook failures and pump death end with
+`ProviderLost`-style behavior, not crashes or busy loops.
+
+### 9.5 Virtual desktops: status
+
+Windows virtual desktops have no documented API for *third-party*
+windows: `IVirtualDesktopManager` is documented only for the caller's
+own windows and fails with foreign hwnds. The reverse-engineered
+`IVirtualDesktopManagerInternal` route is out of scope per the phase
+rules (maintenance risk without stability guarantees). Therefore:
+`workspaces: false`, `window_workspace: false` — unavailable and
+documented, not faked. Core Windows awareness does not depend on this.
+
+## 10. Runtime portability status
+
+The desktop-awareness **architecture** is platform-neutral: `ocm-desktop`
+compiles everywhere (cross-checked for the Windows target), providers
+implement one neutral trait, the runtime consumes only neutral types.
+
+The **runtime binary** remains Wayland-hosted (layer-shell surface,
+calloop, Vulkan-Wayland renderer). Its provider wiring moved behind an
+explicit seam (`apps/ocm-runtime/src/desktop.rs`): one neutral
+`attach()` call, one cfg-gated implementation per platform — Niri on
+Linux (unchanged, suite-validated), a logged absence elsewhere.
+Running the character app on Windows needs, in addition to the provider
+(which is done): a layered-window platform backend in `ocm-platform`,
+a Win32 message loop implementing the event-source contract, and
+DXGI/`raw-window-handle` surface wiring in the renderer. That is the
+documented next-phase porting surface — **no fake Windows overlay
+exists, and full Windows compatibility is not claimed**.
+
+## 11. Windows manual validation (for the user)
+
+On a real Windows machine:
+
+```sh
+cargo run -p ocm-desktop-windows --example win-probe
+```
+
+Checks, in order:
+
+1. **Monitors**: one line per display — verify physical resolution,
+   scale (`DPI/96`), logical position/size, work area (taskbar
+   subtracted), primary flag against the real arrangement. Repeat with
+   mixed-DPI monitors and a monitor placed at negative offsets /
+   with a gap.
+2. **Windows snapshot**: titles, app ids, pids, geometry, states.
+   Compare a window's reported geometry with its visible bounds.
+3. **Events**: open and close a window (`window-added` /
+   `window-removed`), minimize and restore it (`window-changed` with
+   geometry none/present), maximize it, focus between two windows
+   (`window-focused`), drag a window across monitors (continuous
+   `window-changed`), then unplug or change a monitor (outputs-changed
+   within ~10 s).
+4. **Idle behavior**: with nothing happening, the probe prints
+   nothing — no polling noise; CPU near zero.
+5. **Teardown**: Ctrl+C exits cleanly.
+
+Also run the unit test binary natively (`cargo test -p
+ocm-desktop-windows`) — the 11 pure-translation fixture tests execute
+on Windows as well.
+
+## 12. Multi-output movement (investigated, not implemented)
 
 The environment and layout are ready (regions, per-output scales,
 `nearest_output`, conversion both ways), but actual cross-output
@@ -297,10 +487,10 @@ phase that implements cross-output behavior — with the same honesty
 rule: nothing moves between outputs until that mechanism exists and is
 validated.
 
-## 10. Performance
+## 13. Performance
 
-All measurements on the dev machine (Niri 26.04, RTX 5050, debug build
-unless noted):
+Niri measurements on the dev machine (Niri 26.04, RTX 5050, debug
+build unless noted):
 
 | Measurement | Result |
 |---|---|
@@ -317,38 +507,60 @@ actually changes (event-driven fd, no polling loop); a busy desktop
 produces proportionally small parse+diff work and **zero frames** —
 awareness never renders.
 
-## 11. Limitations
+**Windows measurements: none.** The provider design keeps the same
+invariants (event-driven hook, coalesced re-queries, a 10 s monitor
+tick that is one enumeration ≈ 0.1 ms), but idle CPU/wakeup/memory
+numbers require a real Windows session and have **not** been measured —
+the `win-probe` session in §11 is where they get recorded (add a
+procfs-style reading from Task Manager or `typeperf` during the idle
+phase and note it here).
+
+## 14. Limitations
 
 - Niri window geometry: floating windows only (tiled → `None`).
   Position-accurate "walking on windows" for tiled layouts needs either
   an upstream niri change or a helper; nothing is faked meanwhile.
 - No minimized/maximized/fullscreen knowledge on Niri.
 - No work areas / primary output on Niri (model + runtime plumbing
-  ready for providers that have them).
+  ready for providers that have them — Windows exercises both paths in
+  fixtures, pending runtime validation).
 - No output events on Niri → 30 s re-poll latency for output changes.
   (The character's own output changes still arrive instantly via the
   layer-shell configure/fractional-scale events.)
+- Windows: no monitor-change push → 10 s pump-tick latency (§9.4).
+- Windows: fullscreen deliberately undetected (would be a heuristic);
+  virtual desktops unavailable (§9.5).
+- Windows: everything in §9 is type-checked cross-platform and
+  fixture-tested, but **not yet executed on Windows hardware** — the
+  capability matrix says "Implemented, pending Windows validation"
+  until the user's `win-probe` run (§11).
 - Workspace urgency is parsed but not represented in the neutral event
   set (planned; `WorkspaceInfo.urgent` exists for snapshots).
 - The runtime window-overlap report is logging-only: no behavior reads
   windows yet (per phase scope).
 - Multi-output runtime validation remains single-output on the dev
-  machine (§9).
+  machine (§12).
+- The character application is not Windows-hostable yet (§10): desktop
+  awareness is, the runtime/overlay is not.
 
-## 12. Adding a provider (guide)
+## 15. Adding a provider (guide)
 
-1. New crate depending on `ocm-desktop` (+ your transport).
+1. New crate depending on `ocm-desktop` (+ your transport); keep the
+   translation layer pure (plain-data structs) and the API layer
+   platform-gated, mirroring `translate.rs`/`api.rs` in
+   `ocm-desktop-windows`.
 2. Implement `DesktopProvider`: truthful `capabilities()`, blocking
-   `snapshot()`, non-blocking `poll_events()` (+ `watch_fd()`) when the
-   compositor pushes, and `refresh_outputs()` when its stream misses
-   outputs.
-3. Translate compositor structures into the neutral model; `None` for
-   anything the compositor does not expose — never defaults.
-4. Add a calloop source mirroring `NiriSource` (readiness-driven,
-   `ProviderLost` + `PostAction::Remove` on connection death — a
-   source `Err` kills the whole loop).
-5. Tests: wire-format fixtures captured from the real compositor
-   (mocked, run everywhere) + live tests that skip without the
-   compositor socket, clearly separated.
+   `snapshot()`, non-blocking `poll_events()`, and `refresh_outputs()`
+   when your push stream misses outputs. (The trait is
+   transport-neutral: no file descriptors, sockets or OS types.)
+3. Translate platform structures into the neutral model; `None` for
+   anything the platform does not expose — never defaults.
+4. Event-loop integration is the provider crate's business (see
+   `NiriSource` for the calloop shape; the Windows provider pumps its
+   own hook thread and exposes only `poll_events`).
+5. Tests: fixtures over captured real data (run everywhere) + live
+   tests that skip without the platform, clearly separated; for
+   non-host platforms add a cross-check harness
+   (`tests/windows-crosscheck.sh` is the pattern).
 6. Document the capability rows in §8 with the same labels, and update
-   the runtime wiring if the provider needs construction flags.
+   the runtime seam if the provider needs construction flags.

@@ -85,7 +85,10 @@ Dependency directions (enforced by Cargo manifests, [Verified] by inspection):
 - `ocm-character` → `ocm-core`, `ocm-platform` — only the **neutral**
   types (`Rect`, `PointerEvent`); never a Wayland or GPU type.
 - `ocm-desktop` → `ocm-platform` (the `Rect` type) only — pure model,
-  no compositor, no renderer.
+  no compositor, no renderer, no OS assumption.
+- `ocm-desktop-windows` → `ocm-desktop` (+ the `windows` crate on
+  Windows targets only); all Win32 code is cfg(windows) and
+  cross-checked on Linux (`tests/windows-crosscheck.sh`).
 - `ocm-desktop-niri` → `ocm-desktop` (+ `serde`, `serde_json`,
   `calloop`); niri specifics never leak past it.
 - `ocm-renderer` → `ocm-core`, `ocm-character` (model + pose types),
@@ -101,8 +104,9 @@ Dependency directions (enforced by Cargo manifests, [Verified] by inspection):
 | `ocm-core` | `Config` (TOML schema), `Layer`, `KeyboardInteractivity`, error enums, `tracing` init | Wayland, wgpu, character state |
 | `ocm-character` | Semantic model elements + roles, the character state machine (`Phase`), pointer-interaction interpretation, deterministic physics, the animation seam (`AnimatedPose`), desktop output bounds | Wayland, wgpu, Bevy, renderer types |
 | `ocm-platform` | `PlatformEvent`, `PointerEvent`, `Rect`, `NativeHandles`, `OverlaySurface`/`Platform` traits, `MonitorInfo` | Any concrete windowing stack |
-| `ocm-desktop` | Neutral desktop environment model (outputs, windows, workspaces, capabilities), `EnvironmentEvent`s, `DesktopEnvironment` accumulator, region-based `DesktopLayout`, `DesktopProvider` contract | Any compositor, protocol or renderer |
-| `ocm-desktop-niri` | Niri IPC socket client, wire-format mirrors, `NiriProvider` (snapshot/event stream/output re-poll), calloop `NiriSource` | Rendering, character behavior |
+| `ocm-desktop` | Neutral desktop environment model (outputs, windows, workspaces, capabilities), `EnvironmentEvent`s, `DesktopEnvironment` accumulator, region-based `DesktopLayout`, platform-neutral `DesktopProvider` contract | Any compositor, protocol, renderer or OS |
+| `ocm-desktop-niri` | Niri IPC socket client, wire-format mirrors, `NiriProvider` (snapshot/event stream/output re-poll), calloop `NiriSource` (Unix-only by transport) | Rendering, character behavior |
+| `ocm-desktop-windows` | Pure Win32→neutral translation layer (fixture-tested everywhere), cfg(windows) API layer, `WindowsProvider` (monitor/window discovery, DWM geometry, WinEvent tracking) | Rendering, character behavior |
 | `ocm-platform-wayland` | Connection, registry, globals, layer surface, `wl_seat`/`wl_pointer`, `wl_output` + `zxdg_output`, fractional-scale + viewporter, frame callbacks, calloop `EventSource` | wgpu, render math, character logic |
 | `ocm-renderer` | wgpu instance/device/queue, surface creation from raw handles, pipelines, part-based model drawing, camera + per-element hitbox math | Wayland client types, character behavior |
 | `ocm-runtime` | CLI/config merge, character + platform + renderer construction, scheduler, sleep timer, input-region policy (grab ↔ element rects, deduplicated), teardown | Protocol details |
@@ -511,3 +515,30 @@ changes no validated behavior:
   matrix and measurements: `docs/desktop-awareness.md`.
 - Suite: 45 checks per renderer backend (was 30; 15 new awareness
   checks), passing for `--renderer wgpu` and `--renderer bevy`.
+
+## 19. Phase 3c: cross-platform desktop awareness — Windows (2026-11-20)
+
+The shared model (`ocm-desktop`) became fully platform-neutral:
+
+- `DesktopProvider` lost its last Unix-ism (`watch_fd`/`RawFd`, unused);
+  the trait carries no OS types. Capability granularity was split where
+  platforms differ honestly (`window_min_max_state` vs
+  `window_fullscreen_state`, new `window_visibility`), and `WindowInfo`
+  gained `pid` (Niri reported it already).
+- **`ocm-desktop-windows`** (new): the native Win32 provider —
+  `EnumDisplayMonitors`/`GetMonitorInfoW`/`EnumDisplaySettingsW`/
+  `GetDpiForMonitor` (real work areas + primary flag, per-monitor DPI),
+  `EnumWindows` + DWM extended-frame-bounds geometry + documented
+  filtering (invisible/cloaked/tool windows), `SetWinEventHook`
+  tracking on a dedicated message-pump thread with coalesced
+  re-queries. Design: a pure translation layer (fixture-tested on
+  every OS) + a cfg(windows) API layer (type-checked on every Linux
+  run via `tests/windows-crosscheck.sh`).
+- The runtime's provider wiring moved behind an explicit per-platform
+  seam (`apps/ocm-runtime/src/desktop.rs`). The character app is NOT
+  Windows-hostable yet (overlay/event-loop/renderer porting surface
+  documented in `docs/desktop-awareness.md` §10); Windows awareness is
+  validated standalone via the `win-probe` example — **runtime
+  validation on Windows hardware is the user's manual step and has not
+  happened yet**; no Windows runtime claims are made.
+- Niri is unchanged and preserved: 45/45 checks on both renderers.
