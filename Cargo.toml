@@ -28,7 +28,7 @@ raw-window-handle = "0.6"
 calloop = "0.14"
 
 # Graphics (Vulkan-only surface for the PoC; exact version locked by Cargo.lock)
-wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl", "std"] }
+wgpu = { version = "30", default-features = false, features = ["vulkan", "dx12", "wgsl", "std"] }
 
 # Engine (Phase 2b Bevy backend; render-stack features only, selected in
 # ocm-renderer — winit/X11 stay out of the dependency graph)

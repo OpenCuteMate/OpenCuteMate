@@ -50,6 +50,7 @@ fn attach_platform(
 ) {
     use ocm_desktop::{DesktopEnvironment, DesktopProvider, EnvironmentEvent};
     use ocm_desktop_niri::{NiriProvider, NiriSource};
+    use ocm_platform::OverlaySurface;
 
     // Additive by design: without a provider the runtime is exactly the
     // validated Phase 3a app. The provider feeds snapshots and events;

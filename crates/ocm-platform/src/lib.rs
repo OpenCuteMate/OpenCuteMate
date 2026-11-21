@@ -153,6 +153,27 @@ pub trait OverlaySurface {
 
     /// Commit the surface (applies pending double-buffered state).
     fn commit(&self);
+
+    /// Name of the output/monitor this overlay covers, when the platform
+    /// has stable output identifiers (Wayland output name, Win32 device
+    /// name). Desktop-environment data is keyed on it.
+    fn target_output(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether the platform delivers compositor frame callbacks
+    /// (`PlatformEvent::Frame`). Compositor-paced surfaces (Wayland)
+    /// return `true`; timer-paced surfaces (Win32, which has no
+    /// presentation callback) return `false` and the scheduler arms its
+    /// own frame deadlines.
+    fn supports_frame_callbacks(&self) -> bool {
+        true
+    }
+
+    /// Ask the platform to make a color fully transparent at the window
+    /// system level. Only meaningful for platforms/backends without
+    /// per-pixel alpha (Win32 color-key fallback); a no-op elsewhere.
+    fn set_color_key(&self, _key: (u8, u8, u8)) {}
 }
 
 /// A platform backend that can enumerate monitors and create overlays.

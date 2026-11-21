@@ -801,8 +801,11 @@ fn main() -> ExitCode {
     );
 
     // ---- Renderer -------------------------------------------------------------
+    // Platform render options: Wayland surfaces always composite per-pixel
+    // alpha; the Windows driver sets the Opaque fallback where needed.
     let render_opts = RenderOpts {
         vsync: config.render.vsync,
+        ..RenderOpts::default()
     };
     let backend = args.renderer.as_deref().unwrap_or("wgpu");
     let renderer: Box<dyn Renderer> = match backend {

@@ -49,6 +49,26 @@ pub use ocm_character::{AnimatedPose, ElementId};
 pub struct RenderOpts {
     /// `true` = Fifo (vsync), `false` = best-effort no-vsync.
     pub vsync: bool,
+    /// Allow configuring an **Opaque** surface when the backend offers no
+    /// compositing alpha mode. Win32 DX12 HWND surfaces report only
+    /// `Opaque`; the runtime then applies a window-system color key and
+    /// the renderer clears to `opaque_clear_color` (skipping the soft
+    /// shadow, which cannot survive binary keying). Wayland leaves this
+    /// `false`: an opaque layer-shell surface is an error there.
+    pub allow_opaque_fallback: bool,
+    /// Clear color used when the negotiated surface is Opaque (the color
+    /// key the platform makes transparent). Linear RGBA.
+    pub opaque_clear_color: [f32; 4],
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        Self {
+            vsync: true,
+            allow_opaque_fallback: false,
+            opaque_clear_color: [1.0, 0.0, 1.0, 1.0],
+        }
+    }
 }
 
 /// A snapshot of the character state to render.

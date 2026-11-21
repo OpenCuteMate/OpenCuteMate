@@ -33,4 +33,13 @@ pub trait Renderer {
     /// must never move the input region, or every animated frame would
     /// commit a compositor state update.
     fn character_hitboxes(&self, scene: &SceneState) -> Vec<ElementHitbox>;
+
+    /// Whether the negotiated surface composites with per-pixel alpha.
+    ///
+    /// `true` on compositing surfaces (Wayland layer shells, Win32
+    /// surfaces with a non-Opaque composite mode). When `false` the
+    /// renderer is in the documented Opaque fallback (Win32 DX12
+    /// HWND surfaces report Opaque only) and the runtime must apply a
+    /// platform color key instead of relying on alpha.
+    fn has_per_pixel_alpha(&self) -> bool;
 }

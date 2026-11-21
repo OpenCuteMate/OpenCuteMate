@@ -53,6 +53,7 @@ pub(crate) fn spawn_window(
     native: &NativeSurface,
     buffer: (u32, u32),
     vsync: bool,
+    composite_alpha_mode: bevy::window::CompositeAlphaMode,
 ) -> Entity {
     app.world_mut()
         .spawn((
@@ -65,7 +66,7 @@ pub(crate) fn spawn_window(
                 },
                 // Wayland composites ARGB surfaces premultiplied; Bevy maps
                 // this request onto the wgpu surface configuration verbatim.
-                composite_alpha_mode: bevy::window::CompositeAlphaMode::PreMultiplied,
+                composite_alpha_mode,
                 ..default()
             },
             native.raw_handle_wrapper().expect("raw handle wrapper"),

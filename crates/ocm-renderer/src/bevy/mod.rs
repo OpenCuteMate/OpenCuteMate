@@ -36,9 +36,9 @@ use scene::SceneEntities;
 /// in the instance descriptor), packaged for Bevy's manual render creation.
 fn create_render_resources(
     native: &handles::NativeSurface,
-) -> Result<RenderResources, RendererError> {
+) -> Result<(RenderResources, wgpu::CompositeAlphaMode), RendererError> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
+        backends: crate::wgpu::instance_backends(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
@@ -73,6 +73,41 @@ fn create_render_resources(
         "GPU adapter selected (manual render creation)"
     );
 
+    // Alpha negotiation, pre-flighted on the same adapter/surface Bevy
+    // will configure: PreMultiplied/Inherit/PostMultiplied give per-pixel
+    // compositing; an Opaque-only surface (Win32 DX12 HWND) selects the
+    // documented color-key fallback when the runtime allows it.
+    let caps = surface.get_capabilities(&adapter);
+    let alpha_mode = caps
+        .alpha_modes
+        .iter()
+        .copied()
+        .find(|m| *m == wgpu::CompositeAlphaMode::PreMultiplied)
+        .or_else(|| {
+            caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::CompositeAlphaMode::Inherit)
+        })
+        .or_else(|| {
+            caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied)
+        })
+        .or_else(|| {
+            caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
+        })
+        .ok_or_else(|| RendererError::NoAlphaMode(format!("{:?}", caps.alpha_modes)))?;
+    tracing::info!(
+        alpha_modes = ?caps.alpha_modes,
+        chosen = ?alpha_mode,
+        "bevy surface alpha negotiation"
+    );
+
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("ocm-bevy device"),
         required_features: wgpu::Features::empty(),
@@ -87,12 +122,15 @@ fn create_render_resources(
     // creates its own surface from the same handles inside the plugin.
     drop(surface);
 
-    Ok(RenderResources(
-        bevy::render::renderer::RenderDevice::from(device),
-        bevy::render::renderer::RenderQueue::new(queue),
-        bevy::render::renderer::RenderAdapterInfo::new(adapter_info),
-        bevy::render::renderer::RenderAdapter::new(adapter),
-        bevy::render::renderer::RenderInstance::new(instance),
+    Ok((
+        RenderResources(
+            bevy::render::renderer::RenderDevice::from(device),
+            bevy::render::renderer::RenderQueue::new(queue),
+            bevy::render::renderer::RenderAdapterInfo::new(adapter_info),
+            bevy::render::renderer::RenderAdapter::new(adapter),
+            bevy::render::renderer::RenderInstance::new(instance),
+        ),
+        alpha_mode,
     ))
 }
 
@@ -109,6 +147,9 @@ pub struct BevyRenderer {
     logical: (u32, u32),
     /// Whether the first present already landed (see `warm_up`).
     warmed_up: bool,
+    /// Whether the negotiated surface composites per-pixel alpha
+    /// (`false` = the Opaque color-key fallback is active).
+    per_pixel_alpha: bool,
 }
 
 impl BevyRenderer {
@@ -126,6 +167,15 @@ impl BevyRenderer {
         model: &CharacterModel,
     ) -> Result<Self, RendererError> {
         let native = handles::NativeSurface::new(handles);
+
+        let (render_resources, negotiated_alpha) = create_render_resources(&native)?;
+        if negotiated_alpha == wgpu::CompositeAlphaMode::Opaque && !opts.allow_opaque_fallback {
+            return Err(RendererError::NoAlphaMode(
+                "the surface backend offers Opaque composition only (per-pixel transparency                  unavailable); use --renderer wgpu, or allow the opaque color-key fallback"
+                    .into(),
+            ));
+        }
+        let opaque_fallback = negotiated_alpha == wgpu::CompositeAlphaMode::Opaque;
 
         let mut app = App::new();
         // Plugin order matters: RenderPlugin registers the Shader asset
@@ -155,9 +205,7 @@ impl BevyRenderer {
                 // automatic path would pick an adapter without any
                 // surface-compatibility check, because our window entity is
                 // unknown to `RenderPlugin` at that point.
-                render_creation: RenderCreation::Manual(Box::new(create_render_resources(
-                    &native,
-                )?)),
+                render_creation: RenderCreation::Manual(Box::new(render_resources)),
                 // Compile pipelines inline during updates instead of in the
                 // background: with an event-driven scheduler there is no
                 // "later frame" to finish them in before we park.
@@ -181,13 +229,40 @@ impl BevyRenderer {
         // systems (without these, ViewVisibility stays hidden).
         app.add_plugins(bevy::camera::CameraPlugin);
 
-        let window = scene::spawn_window(&mut app, &native, buffer, opts.vsync);
+        // Request exactly the pre-flighted mode so Bevy's own configure
+        // cannot land on a different one.
+        let composite_alpha_mode = match negotiated_alpha {
+            wgpu::CompositeAlphaMode::PostMultiplied => {
+                bevy::window::CompositeAlphaMode::PostMultiplied
+            }
+            wgpu::CompositeAlphaMode::Opaque => bevy::window::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::Inherit => bevy::window::CompositeAlphaMode::Inherit,
+            _ => bevy::window::CompositeAlphaMode::PreMultiplied,
+        };
+        let window =
+            scene::spawn_window(&mut app, &native, buffer, opts.vsync, composite_alpha_mode);
         let entities = scene::spawn_scene(&mut app, window, model);
 
         // Plugin finish + cleanup: the step a runner would do before the
         // first update (bevy_app's ScheduleRunnerPlugin does the same).
         app.finish();
         app.cleanup();
+
+        // Opaque fallback look: clear to the platform color key and hide
+        // the soft shadow (binary keying cannot keep partial alpha). The
+        // entity is kept so a future resize/alpha change could re-show it.
+        if opaque_fallback {
+            let [r, g, b, _a] = opts.opaque_clear_color;
+            app.world_mut().insert_resource(bevy::camera::ClearColor(
+                bevy::color::Color::linear_rgba(r, g, b, 1.0),
+            ));
+            app.world_mut()
+                .entity_mut(entities.shadow)
+                .insert(bevy::camera::visibility::Visibility::Hidden);
+            tracing::warn!(
+                "bevy surface is Opaque; using the color-key fallback (soft shadow hidden)"
+            );
+        }
 
         Ok(Self {
             app,
@@ -196,6 +271,7 @@ impl BevyRenderer {
             camera: SceneCamera::new(logical),
             logical,
             warmed_up: false,
+            per_pixel_alpha: !opaque_fallback,
         })
     }
 
@@ -315,5 +391,9 @@ impl Renderer for BevyRenderer {
 
     fn character_hitboxes(&self, scene: &SceneState) -> Vec<ElementHitbox> {
         crate::scene::element_hitboxes(scene, &self.model, &self.camera)
+    }
+
+    fn has_per_pixel_alpha(&self) -> bool {
+        self.per_pixel_alpha
     }
 }

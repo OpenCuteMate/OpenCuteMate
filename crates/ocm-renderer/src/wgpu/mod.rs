@@ -83,6 +83,9 @@ pub struct WgpuRenderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     premultiplied: bool,
+    /// Clear color: fully transparent on compositing surfaces, the
+    /// platform color key in the Opaque fallback.
+    clear_color: wgpu::Color,
     uniform_buffer: wgpu::Buffer,
     /// One bind group per uniform slot (parts + the shadow last).
     bind_groups: Vec<wgpu::BindGroup>,
@@ -118,7 +121,7 @@ impl WgpuRenderer {
         model: &CharacterModel,
     ) -> Result<Self, RendererError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
+            backends: instance_backends(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
@@ -227,11 +230,47 @@ impl WgpuRenderer {
                     .copied()
                     .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied)
             })
+            .or_else(|| {
+                // No compositing alpha available (Win32 DX12 HWND
+                // surfaces report Opaque only): the documented color-key
+                // fallback, only where the runtime asked for it.
+                if opts.allow_opaque_fallback {
+                    caps.alpha_modes
+                        .iter()
+                        .copied()
+                        .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| RendererError::NoAlphaMode(format!("{:?}", caps.alpha_modes)))?;
+        let opaque_fallback = alpha_mode == wgpu::CompositeAlphaMode::Opaque;
         let premultiplied = !matches!(alpha_mode, wgpu::CompositeAlphaMode::PostMultiplied);
-        if !premultiplied {
+        if opaque_fallback {
+            tracing::warn!(
+                "surface offers no compositing alpha; using the Opaque color-key fallback                  (soft shadow disabled, transparency is binary)"
+            );
+        } else if !premultiplied {
             tracing::warn!("compositor requires PostMultiplied alpha; shader emits straight alpha");
         }
+
+        let clear_color = if opaque_fallback {
+            wgpu::Color {
+                r: opts.opaque_clear_color[0] as f64,
+                g: opts.opaque_clear_color[1] as f64,
+                b: opts.opaque_clear_color[2] as f64,
+                a: 1.0,
+            }
+        } else {
+            // (0,0,0,0) is both a valid premultiplied and straight-alpha
+            // "empty" pixel.
+            wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }
+        };
 
         // Present mode: Fifo for vsync; AutoNoVsync falls back gracefully.
         let present_mode = if opts.vsync {
@@ -255,7 +294,11 @@ impl WgpuRenderer {
 
         let info = SurfaceInfo {
             adapter: format!("{} ({:?})", adapter_info.name, adapter_info.backend),
-            backend: "Vulkan",
+            backend: match adapter_info.backend {
+                wgpu::Backend::Vulkan => "Vulkan",
+                wgpu::Backend::Dx12 => "Dx12",
+                _ => "other",
+            },
             format,
             alpha_mode,
             present_mode,
@@ -466,6 +509,7 @@ impl WgpuRenderer {
             queue,
             config,
             premultiplied,
+            clear_color,
             uniform_buffer,
             bind_groups,
             part_pipeline,
@@ -613,6 +657,7 @@ impl Renderer for WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let clear_color = self.clear_color;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -627,14 +672,9 @@ impl Renderer for WgpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Fully transparent clear: (0,0,0,0) is both a
-                        // valid premultiplied and straight-alpha "empty".
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
+                        // Transparent clear on alpha-compositing surfaces;
+                        // the platform color key in the Opaque fallback.
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -646,11 +686,15 @@ impl Renderer for WgpuRenderer {
 
             // Painter's order: shadow first, parts over it. No blending —
             // each fragment computes its final alpha-mode-correct color.
-            pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.bind_groups[self.shadow_slot as usize], &[]);
-            pass.set_vertex_buffer(0, self.shadow_vb.slice(..));
-            pass.set_index_buffer(self.shadow_ib.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.shadow_index_count, 0, 0..1);
+            // The soft shadow is alpha-composited and cannot survive
+            // binary color keying: it is skipped in the Opaque fallback.
+            if self.has_per_pixel_alpha() {
+                pass.set_pipeline(&self.shadow_pipeline);
+                pass.set_bind_group(0, &self.bind_groups[self.shadow_slot as usize], &[]);
+                pass.set_vertex_buffer(0, self.shadow_vb.slice(..));
+                pass.set_index_buffer(self.shadow_ib.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..self.shadow_index_count, 0, 0..1);
+            }
 
             pass.set_pipeline(&self.part_pipeline);
             pass.set_vertex_buffer(0, self.part_vb.slice(..));
@@ -676,6 +720,25 @@ impl Renderer for WgpuRenderer {
 
     fn character_hitboxes(&self, scene: &SceneState) -> Vec<ElementHitbox> {
         scene::element_hitboxes(scene, &self.model, &self.camera)
+    }
+
+    fn has_per_pixel_alpha(&self) -> bool {
+        self.config.alpha_mode != wgpu::CompositeAlphaMode::Opaque
+    }
+}
+
+/// GPU backends the renderer may use: Vulkan on every platform; DX12 is
+/// added on Windows (native, and what most Windows machines have). The
+/// instance is created with exactly these so adapter selection cannot
+/// drift into an untested backend.
+pub(crate) fn instance_backends() -> wgpu::Backends {
+    #[cfg(windows)]
+    {
+        wgpu::Backends::VULKAN | wgpu::Backends::DX12
+    }
+    #[cfg(not(windows))]
+    {
+        wgpu::Backends::VULKAN
     }
 }
 
