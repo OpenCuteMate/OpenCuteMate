@@ -107,6 +107,7 @@ Dependency directions (enforced by Cargo manifests, [Verified] by inspection):
 | `ocm-desktop` | Neutral desktop environment model (outputs, windows, workspaces, capabilities), `EnvironmentEvent`s, `DesktopEnvironment` accumulator, region-based `DesktopLayout`, platform-neutral `DesktopProvider` contract | Any compositor, protocol, renderer or OS |
 | `ocm-desktop-niri` | Niri IPC socket client, wire-format mirrors, `NiriProvider` (snapshot/event stream/output re-poll), calloop `NiriSource` (Unix-only by transport) | Rendering, character behavior |
 | `ocm-desktop-windows` | Pure Win32→neutral translation layer (fixture-tested everywhere), cfg(windows) API layer, `WindowsProvider` (monitor/window discovery, DWM geometry, WinEvent tracking) | Rendering, character behavior |
+| `ocm-platform-windows` | Win32 overlay window (topmost/non-activating/taskbar-free, per-point click-through, color-key fallback), mouse input → neutral events, per-monitor DPI mapping, waitable-timer message loop primitives (Phase 3d) | Rendering math, character logic, desktop model |
 | `ocm-platform-wayland` | Connection, registry, globals, layer surface, `wl_seat`/`wl_pointer`, `wl_output` + `zxdg_output`, fractional-scale + viewporter, frame callbacks, calloop `EventSource` | wgpu, render math, character logic |
 | `ocm-renderer` | wgpu instance/device/queue, surface creation from raw handles, pipelines, part-based model drawing, camera + per-element hitbox math | Wayland client types, character behavior |
 | `ocm-runtime` | CLI/config merge, character + platform + renderer construction, scheduler, sleep timer, input-region policy (grab ↔ element rects, deduplicated), teardown | Protocol details |
@@ -542,3 +543,29 @@ The shared model (`ocm-desktop`) became fully platform-neutral:
   validation on Windows hardware is the user's manual step and has not
   happened yet**; no Windows runtime claims are made.
 - Niri is unchanged and preserved: 45/45 checks on both renderers.
+
+## 20. Phase 3d: Windows runtime (2026-11-21)
+
+The runtime became platform-neutral, with no duplicated character logic:
+
+- `apps/ocm-runtime/src/app.rs` — the whole application behaviour
+  (character, interaction, scheduler, input-region policy, desktop
+  integration) with scheduling expressed as deadlines instead of calloop
+  tokens.
+- `wayland.rs` — the calloop driver (event order, timers, source
+  registration and teardown unchanged from the validated Phase 3b
+  runtime); `windows.rs` — the Win32 driver (overlay, high-resolution
+  waitable-timer deadlines, `MsgWaitForMultipleObjectsEx` with an
+  `INFINITE` idle wait, provider wake event).
+- `ocm-platform-windows` (new): the native overlay — one topmost,
+  non-activating, taskbar-free `WS_POPUP` window per monitor, per-point
+  click-through via `WM_NCHITTEST`, DPI-aware coordinate conversion,
+  `WM_DPICHANGED`/`WM_DISPLAYCHANGE` reconciliation, and the documented
+  color-key fallback for backends without compositing alpha.
+- Renderers negotiate alpha on both platforms; the DX12 HWND path
+  (Opaque only) degrades to the color key instead of silently failing.
+- Platform dependencies are target-gated (calloop/wayland/niri on Unix;
+  Win32 crates on Windows), so the runtime cross-compiles for Windows.
+- Validation: Linux Niri suite unchanged at 45/45 per renderer; Windows
+  code type-checked cross-platform and fixture-tested, **not yet executed
+  on Windows hardware** (`docs/windows-runtime.md` §8 checklist).

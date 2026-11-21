@@ -424,21 +424,21 @@ documented, not faked. Core Windows awareness does not depend on this.
 
 ## 10. Runtime portability status
 
-The desktop-awareness **architecture** is platform-neutral: `ocm-desktop`
-compiles everywhere (cross-checked for the Windows target), providers
-implement one neutral trait, the runtime consumes only neutral types.
+**Phase 3d delivered the port** (see `docs/windows-runtime.md`): the
+runtime is now one platform-neutral core (`apps/ocm-runtime/src/app.rs`)
+plus two drivers — Wayland/calloop/Niri on Linux, Win32
+overlay/message-loop/hooks on Windows — with a per-OS desktop-provider
+seam. The Windows driver uses `ocm-platform-windows` (native overlay,
+click-through, DPI, waitable-timer scheduling) and attaches this
+provider with the same neutral `EnvironmentEvent` flow. The runtime now
+cross-compiles for Windows and both renderers negotiate alpha (with the
+documented Opaque color-key fallback).
 
-The **runtime binary** remains Wayland-hosted (layer-shell surface,
-calloop, Vulkan-Wayland renderer). Its provider wiring moved behind an
-explicit seam (`apps/ocm-runtime/src/desktop.rs`): one neutral
-`attach()` call, one cfg-gated implementation per platform — Niri on
-Linux (unchanged, suite-validated), a logged absence elsewhere.
-Running the character app on Windows needs, in addition to the provider
-(which is done): a layered-window platform backend in `ocm-platform`,
-a Win32 message loop implementing the event-source contract, and
-DXGI/`raw-window-handle` surface wiring in the renderer. That is the
-documented next-phase porting surface — **no fake Windows overlay
-exists, and full Windows compatibility is not claimed**.
+**Validation status:** Linux remains runtime-validated (Niri suite,
+45/45 per renderer); the Windows runtime is implemented, fixture-tested
+and cross-compiled but **has not been executed on Windows hardware** —
+the manual checklist in `docs/windows-runtime.md` §8 is the pending
+step. No Windows runtime claim is made until that happens.
 
 ## 11. Windows manual validation (for the user)
 

@@ -3,21 +3,19 @@
 An open-source desktop companion (in the spirit of Desktop Mate) — animated
 characters that live on your desktop.
 
-**Status: Phases 1, 2, 2b and 3a complete; Phase 3b implemented — the
-character has desktop environment awareness: a platform-neutral model
-of the desktop it lives in (outputs with per-output scales and
-transforms, work areas, windows with honest capability reporting,
-workspaces), with multi-display coordinate math and an event-driven
-runtime integration that never wakes the idle character. Phase 3c
-extended awareness across platforms: the same neutral model is fed by
-the Niri IPC provider on Linux and by a native Win32 provider on
-Windows (monitor discovery with real work areas, window enumeration
-with DWM visible-bounds geometry, WinEvent-driven tracking). The
-Windows provider is type-checked cross-platform and fixture-tested,
-and awaits runtime validation on real Windows hardware via the
-`win-probe` diagnostic; the character app itself is not
-Windows-hostable yet — that porting surface is documented in
-`docs/desktop-awareness.md` §10.**
+**Status: Phases 1, 2, 2b, 3a and 3b complete; Phase 3c added native
+Windows desktop awareness; Phase 3d added the native Windows runtime
+— the character application now has one platform-neutral core and two
+drivers: Wayland layer-shell/calloop/Niri on Linux and a Win32
+overlay/message-loop/WinEvent provider on Windows, running the same
+character, interaction, physics and scheduler on both. Windows
+transparency negotiates per-pixel alpha with a documented color-key
+fallback, click-through is per-point via hit testing, and idle remains
+event-driven (no timers armed while parked). Linux is runtime-validated
+by the Niri suite; the Windows runtime is implemented, fixture-tested
+and cross-compiled but has **not yet been executed on Windows
+hardware** — the manual checklist in `docs/windows-runtime.md` is the
+pending validation step.**
 
 Phase 2 proved the core architectural assumption:
 
@@ -72,6 +70,14 @@ Phase 3a builds the character system on top:
   one-shots that request frames only while they run, and
   environmental events never schedule a frame (verified: a
   window-churn storm schedules zero frames).
+- **Phase 3d** split the runtime into a neutral core (`app.rs`: the same
+  character/scheduler/input code) plus platform drivers, and added the
+  native Windows backend: `WS_POPUP` topmost, non-activating,
+  taskbar-free overlay per monitor; per-point click-through via
+  `WM_NCHITTEST`; per-monitor DPI mapping to the shared logical
+  coordinate model; a high-resolution waitable timer + message wait for
+  zero-idle scheduling; both renderers alpha-negotiated (Vulkan
+  per-pixel alpha preferred, DX12 color-key fallback).
 
 On the development machine (Niri 26.04, NVIDIA RTX 5050, 1.25×
 fractional scaling) the automated suite passes **45/45 for both
@@ -108,6 +114,7 @@ crates/ocm-renderer          wgpu 30 backend + Bevy 0.20 backend (shared placeme
 apps/ocm-runtime             CLI + main loop + scheduler + input-region policy + teardown
 tests/niri.sh                automated validation suite (nested Niri, both backends)
 tests/windows-crosscheck.sh  type-checks all Windows-targeted code on Linux
+crates/ocm-platform-windows  Win32 overlay, input, DPI, message loop (Phase 3d)
 tests/perf.sh                repeatable renderer performance comparison
 tests/hyprland.sh            the same suite against Hyprland
 docs/                        research + results (all claims labeled Verified/Assumption/Unresolved)
@@ -145,6 +152,9 @@ there).
   glTF/VRM integration, current limitations
 - `docs/desktop-awareness.md` — Phase 3b: environment model, coordinate
   spaces, Niri IPC findings, provider guide, capability matrix, perf
+- `docs/windows-runtime.md` — Phase 3d: Windows overlay/event
+  loop/renderer support, build+run instructions, manual validation
+  checklist, exact validation matrix
 - `docs/bevy-integration.md` — Phase 2b research, pitfalls, results, perf
 - `docs/engine-comparison.md` — Bevy vs Godot vs raw wgpu
 - `docs/wayland-feasibility.md` — layer shell, alpha modes, raw-handle GPU surfaces
