@@ -8,6 +8,7 @@ members = [
     "crates/ocm-desktop-windows",
     "crates/ocm-platform",
     "crates/ocm-platform-wayland",
+    "crates/ocm-platform-windows",
     "crates/ocm-renderer",
     "apps/ocm-runtime",
 ]
@@ -55,6 +56,7 @@ ocm-desktop-niri = { path = "crates/ocm-desktop-niri" }
 ocm-desktop-windows = { path = "crates/ocm-desktop-windows" }
 ocm-platform = { path = "crates/ocm-platform" }
 ocm-platform-wayland = { path = "crates/ocm-platform-wayland" }
+ocm-platform-windows = { path = "crates/ocm-platform-windows" }
 ocm-renderer = { path = "crates/ocm-renderer" }
 
 [profile.release]

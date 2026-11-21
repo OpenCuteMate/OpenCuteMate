@@ -1,0 +1,29 @@
+[package]
+name = "ocm-platform-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ocm-core.workspace = true
+ocm-platform.workspace = true
+raw-window-handle.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# Native Win32 overlay/event-loop APIs. Windows-only: the pure hit-test
+# and coordinate logic plus its tests compile everywhere.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+] }

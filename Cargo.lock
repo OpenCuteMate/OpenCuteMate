@@ -2521,6 +2521,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocm-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "ocm-core",
+ "ocm-platform",
+ "raw-window-handle",
+ "thiserror 2.0.21",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "ocm-renderer"
 version = "0.1.0"
 dependencies = [
