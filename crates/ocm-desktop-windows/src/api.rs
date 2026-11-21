@@ -128,8 +128,10 @@ unsafe extern "system" fn monitor_proc(
         ((w - x).max(0) as u32, (h - y).max(0) as u32)
     };
     if !device.is_empty() {
-        let mut mode = DEVMODEW::default();
-        mode.dmSize = mem::size_of::<DEVMODEW>() as u16;
+        let mut mode = DEVMODEW {
+            dmSize: mem::size_of::<DEVMODEW>() as u16,
+            ..DEVMODEW::default()
+        };
         if EnumDisplaySettingsW(
             PCWSTR::from_raw(device.as_ptr()),
             windows::Win32::Graphics::Gdi::ENUM_CURRENT_SETTINGS,
@@ -209,9 +211,8 @@ unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // No unwraps here: this runs inside a system callback. Any window
     // that fails a query is skipped, never defaulted.
     let data = &mut *(lparam.0 as *mut WindowEnumData);
-    match collect_window(hwnd, data.exe_cache, data.foreground) {
-        Some(raw) => data.out.push(raw),
-        None => {}
+    if let Some(raw) = collect_window(hwnd, data.exe_cache, data.foreground) {
+        data.out.push(raw);
     }
     true.into()
 }
@@ -376,6 +377,35 @@ fn process_image(pid: u32) -> Option<String> {
 /// One raw hook event forwarded to the provider.
 pub(crate) type RawEvent = crate::translate::RawWinEvent;
 
+/// A wake callback the provider sets and the hook thread invokes after
+/// enqueueing events (the consumer's loop waits on an OS handle).
+pub(crate) type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// Shared wake slot (provider side sets it; the pump reads it).
+#[derive(Clone, Default)]
+pub(crate) struct WakeSlot(std::sync::Arc<std::sync::Mutex<Option<WakeFn>>>);
+
+impl WakeSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, wake: WakeFn) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(wake);
+        }
+    }
+
+    /// Invoke the callback without holding the lock (the callback may
+    /// signal an OS object; it must never re-enter this slot).
+    fn notify(&self) {
+        let wake = self.0.lock().ok().and_then(|slot| slot.clone());
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+}
+
 /// Handle to the running hook thread.
 pub(crate) struct HookHandle {
     /// The pump thread's id, so teardown can post `WM_QUIT` to it.
@@ -411,13 +441,14 @@ impl HookHandle {
 pub(crate) fn start_event_thread(
     sender: std::sync::mpsc::SyncSender<RawEvent>,
     monitor_tick_ms: u32,
+    wake: WakeSlot,
 ) -> Result<HookHandle, ApiError> {
     // The pump reports its thread id (and the hook outcome) over a
     // one-shot channel; a timeout bounds a stuck thread.
     let (id_tx, id_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let join = std::thread::Builder::new()
         .name("ocm-desktop-win-events".into())
-        .spawn(move || unsafe { pump(sender, monitor_tick_ms, id_tx) })
+        .spawn(move || unsafe { pump(sender, monitor_tick_ms, id_tx, wake) })
         .map_err(|e| ApiError::Call(format!("event thread spawn: {e}")))?;
 
     match id_rx.recv_timeout(std::time::Duration::from_secs(5)) {
@@ -439,6 +470,8 @@ thread_local! {
     /// lock-free) way for the callback to reach it.
     static SENDER: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<RawEvent>>> =
         const { std::cell::RefCell::new(None) };
+    /// Wake slot for the pump thread (callbacks run on this thread).
+    static WAKE: std::cell::RefCell<Option<WakeSlot>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Total events dropped when the bounded channel was full.
@@ -465,7 +498,13 @@ unsafe extern "system" fn win_event_proc(
         object: id_object,
     };
     let sent = SENDER.with(|sink| sink.borrow().as_ref().map(|s| s.try_send(raw).is_ok()));
-    if sent == Some(false) {
+    if sent == Some(true) {
+        WAKE.with(|wake| {
+            if let Some(wake) = wake.borrow().as_ref() {
+                wake.notify();
+            }
+        });
+    } else if sent == Some(false) {
         let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if dropped == 0 {
             tracing::warn!("event channel full; dropping desktop events until it drains");
@@ -477,14 +516,18 @@ unsafe fn pump(
     sender: std::sync::mpsc::SyncSender<RawEvent>,
     monitor_tick_ms: u32,
     ready: std::sync::mpsc::Sender<Result<u32, String>>,
+    wake: WakeSlot,
 ) {
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, TranslateMessage, MSG, WINEVENT_OUTOFCONTEXT,
     };
 
-    // The thread-local sink must exist before the hook can fire.
+    // The thread-local sink and wake slot must exist before the hook can
+    // fire. The wake notify closure runs on this same thread; the
+    // Mutex+Arc keeps the slot accessible from the pump's timer branch.
     SENDER.with(|sink| *sink.borrow_mut() = Some(sender));
+    WAKE.with(|slot| *slot.borrow_mut() = Some(wake.clone()));
     let thread_id = GetCurrentThreadId();
 
     // One hook over both event families we consume (system 0x0003.. and
@@ -533,8 +576,10 @@ unsafe fn pump(
                 object: crate::translate::win_events::OBJID_WINDOW,
             };
             if SENDER.with(|sink| sink.borrow().as_ref().map(|s| s.try_send(sentinel).is_ok()))
-                == Some(false)
+                == Some(true)
             {
+                wake.notify();
+            } else if SENDER.with(|sink| sink.borrow().is_some()) {
                 let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if dropped == 0 {
                     tracing::warn!("event channel full; monitor refresh dropped");

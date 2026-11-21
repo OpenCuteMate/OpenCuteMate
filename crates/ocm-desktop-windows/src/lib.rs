@@ -161,6 +161,15 @@ impl DesktopProvider for WindowsProvider {
         #[cfg(not(windows))]
         Err(ProviderError::Unavailable)
     }
+
+    fn set_wake_callback(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        #[cfg(windows)]
+        if let Some(state) = &mut self.inner {
+            state.wake.set(wake);
+        }
+        #[cfg(not(windows))]
+        let _ = wake;
+    }
 }
 
 /// Bridge the API-layer error into the neutral provider error.
@@ -205,6 +214,8 @@ mod provider {
         exe_cache: api::ExeCache,
         events: mpsc::Receiver<api::RawEvent>,
         hook: Option<api::HookHandle>,
+        /// Consumer wake signal (set through the provider trait).
+        pub(super) wake: api::WakeSlot,
     }
 
     impl State {
@@ -218,9 +229,11 @@ mod provider {
             tracing::debug!(monitors = monitors.len(), "win32 monitor discovery ok");
 
             let (sender, events) = mpsc::sync_channel(EVENT_CHANNEL_BOUND);
+            let wake = api::WakeSlot::new();
             // A failed hook setup surfaces here: connect fails, the
             // caller treats awareness as unavailable (never fatal).
-            let hook = api::start_event_thread(sender, MONITOR_TICK_MS).map_err(api_error)?;
+            let hook = api::start_event_thread(sender, MONITOR_TICK_MS, wake.clone())
+                .map_err(api_error)?;
             tracing::debug!("win32 event hook running");
 
             Ok(Self {
@@ -228,6 +241,7 @@ mod provider {
                 exe_cache: BTreeMap::new(),
                 events,
                 hook: Some(hook),
+                wake,
             })
         }
 

@@ -64,4 +64,12 @@ pub trait DesktopProvider {
     fn refresh_outputs(&mut self) -> Result<Vec<OutputInfo>, ProviderError> {
         Err(ProviderError::Unsupported)
     }
+
+    /// Ask the provider to invoke `wake` whenever it enqueues events.
+    ///
+    /// Providers that integrate with the consumer's event loop through a
+    /// readiness notification (the Niri fd source) ignore this. Providers
+    /// whose events arrive on a foreign thread (the Win32 hook thread)
+    /// use it so a blocking wait can be woken without polling.
+    fn set_wake_callback(&mut self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
 }

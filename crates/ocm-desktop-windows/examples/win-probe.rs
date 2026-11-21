@@ -29,12 +29,8 @@ fn main() {
         ocm_desktop_windows::WindowsProvider::connect().expect("connect to the Windows session");
     let caps = provider.capabilities();
     println!(
-        "provider: {} (event_stream={} work_areas={} window_state={} fullscreen={})",
-        "win32",
-        caps.event_stream,
-        caps.work_areas,
-        caps.window_min_max_state,
-        caps.window_fullscreen_state,
+        "provider: win32 (event_stream={} work_areas={} window_state={} fullscreen={})",
+        caps.event_stream, caps.work_areas, caps.window_min_max_state, caps.window_fullscreen_state,
     );
 
     let snapshot = provider.snapshot().expect("initial snapshot");

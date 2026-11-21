@@ -19,11 +19,21 @@ renderer-bevy = ["ocm-renderer/bevy-backend"]
 ocm-core.workspace = true
 ocm-character.workspace = true
 ocm-desktop.workspace = true
-ocm-desktop-niri.workspace = true
 ocm-platform.workspace = true
-ocm-platform-wayland.workspace = true
 ocm-renderer.workspace = true
-calloop.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Linux/Wayland driver: calloop event loop, layer-shell backend, Niri
+# desktop provider.
+[target.'cfg(unix)'.dependencies]
+ocm-platform-wayland.workspace = true
+ocm-desktop-niri.workspace = true
+calloop.workspace = true
+
+# Windows driver: Win32 overlay/message loop backend + Win32 desktop
+# provider.
+[target.'cfg(windows)'.dependencies]
+ocm-platform-windows.workspace = true
+ocm-desktop-windows.workspace = true
